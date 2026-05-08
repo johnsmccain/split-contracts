@@ -1,0 +1,48 @@
+name: Deploy to Testnet
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build contract (release)
+        run: cargo build --target wasm32-unknown-unknown --release --workspace
+
+      - name: Install stellar-cli
+        run: cargo install --locked stellar-cli --features opt
+
+      - name: Configure testnet identity
+        run: |
+          stellar keys generate deployer --network testnet
+        env:
+          STELLAR_SECRET_KEY: ${{ secrets.TESTNET_SECRET_KEY }}
+
+      - name: Deploy contract
+        run: |
+          stellar contract deploy \
+            --wasm target/wasm32-unknown-unknown/release/split.wasm \
+            --source deployer \
+            --network testnet \
+            --rpc-url https://soroban-testnet.stellar.org \
+            --network-passphrase "Test SDF Network ; September 2015"
+        env:
+          STELLAR_SECRET_KEY: ${{ secrets.TESTNET_SECRET_KEY }}
