@@ -167,7 +167,7 @@ fn test_pay_after_deadline_panics() {
 
     let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
     env.ledger().set_timestamp(3_000);
-    c.pay(&payer, &id, &100_i128);
+    c.pay(&payer, &id, &100_i128, &0_i128);
 }
 
 #[test]

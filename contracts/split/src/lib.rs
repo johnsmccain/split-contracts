@@ -219,8 +219,8 @@ impl SplitContract {
         }
 
         let deadline = env.ledger().timestamp() + 30 * 24 * 60 * 60;
-        let id = Self::create_invoice(
-            env.clone(),
+        let id = Self::_create_invoice(
+            &env,
             creator.clone(),
             recipients.clone(),
             amounts.clone(),
@@ -264,13 +264,14 @@ impl SplitContract {
             "invoice deadline has passed"
         );
         assert!(amount > 0, "payment amount must be positive");
+        assert!(tip >= 0, "tip must be non-negative");
 
         let total: i128 = invoice.amounts.iter().sum();
         let remaining = total - invoice.funded;
         assert!(amount <= remaining, "payment exceeds remaining balance");
 
         let token_client = token::Client::new(&env, &invoice.token);
-        token_client.transfer(&payer, &env.current_contract_address(), &amount);
+        token_client.transfer(&payer, &env.current_contract_address(), &(amount + tip));
 
         invoice.payments.push_back(Payment { payer: payer.clone(), amount });
         invoice.funded += amount;
@@ -318,12 +319,17 @@ impl SplitContract {
 
         let token_client = token::Client::new(&env, &invoice.token);
 
+        // Aggregate total owed per unique payer (amount + tip).
+        let mut totals: Map<Address, i128> = Map::new(&env);
         for payment in invoice.payments.iter() {
-            token_client.transfer(
-                &env.current_contract_address(),
-                &payment.payer,
-                &payment.amount,
-            );
+            let prev = totals.get(payment.payer.clone()).unwrap_or(0);
+            totals.set(payment.payer.clone(), prev + payment.amount + payment.tip);
+        }
+
+        // One transfer + one event per unique payer.
+        for (payer, amount) in totals.iter() {
+            token_client.transfer(&env.current_contract_address(), &payer, &amount);
+            events::payer_refunded(&env, invoice_id, &payer, amount);
         }
 
         // Refund unused bonus pool back to creator.
@@ -424,6 +430,8 @@ impl SplitContract {
 
     /// Generate a completion proof for a finalized invoice.
     pub fn get_completion_proof(env: Env, invoice_id: u64) -> CompletionProof {
+        use soroban_sdk::Bytes;
+
         let invoice = load_invoice(&env, invoice_id);
 
         assert!(
@@ -451,7 +459,7 @@ impl SplitContract {
             InvoiceStatus::Refunded => 2u8,
             InvoiceStatus::Cancelled => 3u8,
         };
-        bytes.push(s_byte);
+        bytes.extend_from_array(&[s_byte]);
 
         let hash = env.crypto().sha256(&bytes).to_bytes();
 
@@ -592,7 +600,11 @@ impl SplitContract {
         );
 
         for (recipient, amount) in invoice.recipients.iter().zip(invoice.amounts.iter()) {
-            token_client.transfer(&env.current_contract_address(), &recipient, &amount);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &(amount + tip_per_recipient),
+            );
         }
 
         // Distribute bonus pool equally among first `bonus_max_payers` unique payers.
