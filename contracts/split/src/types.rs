@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Vec};
+use soroban_sdk::{contracttype, Address, Symbol, Vec};
 
 /// Status of an invoice lifecycle.
 #[contracttype]
@@ -10,6 +10,8 @@ pub enum InvoiceStatus {
     Released,
     /// Deadline passed before full funding; payers refunded.
     Refunded,
+    /// Invoice cancelled by creator before payments.
+    Cancelled,
 }
 
 /// A single payment made toward an invoice.
@@ -20,6 +22,18 @@ pub struct Payment {
     pub payer: Address,
     /// Amount paid in stroops (7 decimal places).
     pub amount: i128,
+}
+
+/// An audit log entry recording a state change.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AuditEntry {
+    /// Action type (e.g., "pay", "release", "refund").
+    pub action: Symbol,
+    /// Address that triggered the action.
+    pub actor: Address,
+    /// Ledger timestamp when the action occurred.
+    pub timestamp: u64,
 }
 
 /// An on-chain invoice splitting payment among multiple recipients.

@@ -250,3 +250,91 @@ fn test_multi_recipient_release() {
     assert_eq!(tk.balance(&r2), 200);
     assert_eq!(tk.balance(&r3), 300);
 }
+
+#[test]
+fn test_audit_log() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let stellar_asset = StellarAssetClient::new(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    stellar_asset.mint(&payer, &500);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(200_i128);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64);
+
+    // Perform 3 actions: pay, release, cancel_invoice
+    c.pay(&payer, &id, &200_i128);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.status, InvoiceStatus::Released);
+
+    // Check audit log has 2 entries (pay and release)
+    let log = c.get_audit_log(&id);
+    assert_eq!(log.len(), 2);
+    assert_eq!(log.get_unchecked(0).action, symbol_short!("pay"));
+    assert_eq!(log.get_unchecked(1).action, symbol_short!("release"));
+}
+
+#[test]
+fn test_audit_log_with_cancel() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64);
+
+    // Cancel the invoice
+    c.cancel_invoice(&creator, &id);
+
+    // Check audit log has 1 entry (cancel)
+    let log = c.get_audit_log(&id);
+    assert_eq!(log.len(), 1);
+    assert_eq!(log.get_unchecked(0).action, symbol_short!("cancel"));
+    assert_eq!(log.get_unchecked(0).actor, creator);
+}
+
+#[test]
+fn test_audit_log_with_extend() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000_u64);
+
+    // Extend the deadline
+    c.extend_deadline(&creator, &id, &9_999_u64);
+
+    // Check audit log has 1 entry (extend)
+    let log = c.get_audit_log(&id);
+    assert_eq!(log.len(), 1);
+    assert_eq!(log.get_unchecked(0).action, symbol_short!("extend"));
+    assert_eq!(log.get_unchecked(0).actor, creator);
+}

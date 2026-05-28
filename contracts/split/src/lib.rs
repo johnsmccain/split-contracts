@@ -13,7 +13,7 @@ mod types;
 mod test;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Symbol, Vec};
-use types::{Invoice, InvoiceStatus, Payment};
+use types::{Invoice, InvoiceStatus, Payment, AuditEntry};
 
 // ---------------------------------------------------------------------------
 // Storage helpers
@@ -40,6 +40,39 @@ fn save_invoice(env: &Env, id: u64, invoice: &Invoice) {
     env.storage()
         .persistent()
         .set(&invoice_key(id), invoice);
+}
+
+/// Storage key for the audit log: (symbol, invoice_id).
+fn audit_log_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("log"), id)
+}
+
+/// Append an audit entry to the log for an invoice.
+fn append_audit_entry(env: &Env, id: u64, action: Symbol, actor: &Address) {
+    let timestamp = env.ledger().timestamp();
+    let entry = AuditEntry {
+        action,
+        actor: actor.clone(),
+        timestamp,
+    };
+
+    // Try to load existing log, create new one if not present
+    let mut log: Vec<AuditEntry> = env
+        .storage()
+        .persistent()
+        .get(&audit_log_key(id))
+        .unwrap_or_else(|| Vec::new(env));
+
+    log.push_back(entry);
+    env.storage().persistent().set(&audit_log_key(id), &log);
+}
+
+/// Retrieve the audit log for an invoice.
+pub fn get_audit_log(env: &Env, id: u64) -> Vec<AuditEntry> {
+    env.storage()
+        .persistent()
+        .get(&audit_log_key(id))
+        .unwrap_or_else(|| Vec::new(env))
 }
 
 // ---------------------------------------------------------------------------
@@ -152,11 +185,12 @@ impl SplitContract {
         });
         invoice.funded += amount;
 
+        append_audit_entry(&env, invoice_id, symbol_short!("pay"), &payer);
         events::payment_received(&env, invoice_id, &payer, amount);
 
         // Auto-release if fully funded.
         if invoice.funded >= total {
-            Self::_release(&env, invoice_id, &mut invoice);
+            Self::_release(&env, invoice_id, &mut invoice, &invoice.creator);
         } else {
             save_invoice(&env, invoice_id, &invoice);
         }
@@ -166,6 +200,7 @@ impl SplitContract {
     ///
     /// Can be called by anyone; validates full funding internally.
     pub fn release(env: Env, invoice_id: u64) {
+        let caller = env.current_contract_address();
         let mut invoice = load_invoice(&env, invoice_id);
 
         assert!(
@@ -176,7 +211,7 @@ impl SplitContract {
         let total: i128 = invoice.amounts.iter().sum();
         assert!(invoice.funded >= total, "invoice not fully funded");
 
-        Self::_release(&env, invoice_id, &mut invoice);
+        Self::_release(&env, invoice_id, &mut invoice, &caller);
     }
 
     /// Refund all payers if the deadline has passed and the invoice is not fully funded.
@@ -206,7 +241,70 @@ impl SplitContract {
 
         invoice.status = InvoiceStatus::Refunded;
         save_invoice(&env, invoice_id, &invoice);
+        let actor = env.current_contract_address();
+        append_audit_entry(&env, invoice_id, symbol_short!("refund"), &actor);
         events::invoice_refunded(&env, invoice_id);
+    }
+
+    /// Cancel an invoice before any payments are made.
+    ///
+    /// Only the creator can cancel, and it must be before payments start.
+    ///
+    /// # Arguments
+    /// * `caller`     – must be the invoice creator (must authorise)
+    /// * `invoice_id` – target invoice
+    pub fn cancel_invoice(env: Env, caller: Address, invoice_id: u64) {
+        caller.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        assert!(
+            invoice.status == InvoiceStatus::Pending,
+            "invoice is not pending"
+        );
+        assert!(
+            invoice.creator == caller,
+            "only creator can cancel"
+        );
+        assert!(
+            invoice.funded == 0,
+            "cannot cancel invoice with payments"
+        );
+
+        invoice.status = InvoiceStatus::Cancelled;
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("cancel"), &caller);
+    }
+
+    /// Extend the deadline for an invoice.
+    ///
+    /// Only the creator can extend, and the new deadline must be in the future.
+    ///
+    /// # Arguments
+    /// * `caller`     – must be the invoice creator (must authorise)
+    /// * `invoice_id` – target invoice
+    /// * `new_deadline` – new Unix timestamp for the deadline
+    pub fn extend_deadline(env: Env, caller: Address, invoice_id: u64, new_deadline: u64) {
+        caller.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        assert!(
+            invoice.status == InvoiceStatus::Pending,
+            "invoice is not pending"
+        );
+        assert!(
+            invoice.creator == caller,
+            "only creator can extend deadline"
+        );
+        assert!(
+            new_deadline > env.ledger().timestamp(),
+            "new deadline must be in the future"
+        );
+
+        invoice.deadline = new_deadline;
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("extend"), &caller);
     }
 
     /// Retrieve an invoice by ID.
@@ -214,12 +312,17 @@ impl SplitContract {
         load_invoice(&env, invoice_id)
     }
 
+    /// Retrieve the audit log for an invoice.
+    pub fn get_audit_log(env: Env, invoice_id: u64) -> Vec<AuditEntry> {
+        get_audit_log(&env, invoice_id)
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
     /// Route funds to all recipients and mark the invoice as released.
-    fn _release(env: &Env, invoice_id: u64, invoice: &mut Invoice) {
+    fn _release(env: &Env, invoice_id: u64, invoice: &mut Invoice, actor: &Address) {
         let token_client = token::Client::new(env, &invoice.token);
 
         for (recipient, amount) in invoice.recipients.iter().zip(invoice.amounts.iter()) {
@@ -228,6 +331,7 @@ impl SplitContract {
 
         invoice.status = InvoiceStatus::Released;
         save_invoice(env, invoice_id, invoice);
+        append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
         events::invoice_released(env, invoice_id, &invoice.recipients);
     }
 }
