@@ -5,3 +5,8 @@ Cargo.lock
 .env.local
 .DS_Store
 Thumbs.db
+**/*.snap
+**/*.d
+*.log
+.idea/
+.vscode/

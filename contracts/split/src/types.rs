@@ -66,6 +66,20 @@ pub struct CompletionProof {
     pub hash: BytesN<32>,
 }
 
+/// Parameters for a single invoice in a batch creation call (#44).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CreateInvoiceParams {
+    /// Ordered list of recipient addresses.
+    pub recipients: Vec<Address>,
+    /// Amounts owed to each recipient (parallel to `recipients`).
+    pub amounts: Vec<i128>,
+    /// USDC token contract address.
+    pub token: Address,
+    /// Unix timestamp after which unfunded invoices can be refunded.
+    pub deadline: u64,
+}
+
 /// An on-chain invoice splitting payment among multiple recipients.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -86,4 +100,14 @@ pub struct Invoice {
     pub status: InvoiceStatus,
     /// All payments made toward this invoice.
     pub payments: Vec<Payment>,
+    /// Optional deadline by which recipients must claim their share (#45).
+    /// If None, funds are pushed immediately on release (existing behaviour).
+    pub claim_deadline: Option<u64>,
+    /// Tracks which recipient indices have already claimed (#45).
+    pub claimed: Vec<bool>,
+    /// Ledger timestamp when the invoice was completed (Released/Refunded) (#46).
+    pub completion_time: Option<u64>,
+    /// SAC token addresses minted per recipient at creation (#47).
+    /// proceeds_tokens[i] is the token representing recipient[i]'s share.
+    pub proceeds_tokens: Vec<Address>,
 }
