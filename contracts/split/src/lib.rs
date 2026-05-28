@@ -1,7 +1,7 @@
 //! StellarSplit — on-chain invoice & payment splitting contract.
 //!
 //! Allows a creator to define an invoice with multiple recipients and amounts.
-//! Payers contribute funds; once fully funded the contract auto-routes USDC to
+//! Payers contribute funds; once fully funded the contract auto-routes tokens to
 //! each recipient. If the deadline passes unfunded, payers are refunded.
 
 #![no_std]
@@ -137,17 +137,31 @@ impl SplitContract {
         creator: Address,
         recipients: Vec<Address>,
         amounts: Vec<i128>,
-        token: Address,
+        tokens: Vec<Address>,
         deadline: u64,
         co_creators: Vec<Address>,
         allow_early_withdrawal: bool,
     ) -> u64 {
         require_not_paused(&env);
         creator.require_auth();
+        Self::_create_invoice(&env, creator, recipients, amounts, tokens, deadline)
+    }
 
+    fn _create_invoice(
+        env: &Env,
+        creator: Address,
+        recipients: Vec<Address>,
+        amounts: Vec<i128>,
+        tokens: Vec<Address>,
+        deadline: u64,
+    ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
             "recipients and amounts length mismatch"
+        );
+        assert!(
+            recipients.len() == tokens.len(),
+            "recipients and tokens length mismatch"
         );
         assert!(!recipients.is_empty(), "must have at least one recipient");
         assert!(
@@ -182,7 +196,7 @@ impl SplitContract {
             co_creators,
             recipients: recipients.clone(),
             amounts,
-            token,
+            tokens,
             deadline,
             funded: 0,
             status: InvoiceStatus::Pending,
@@ -202,7 +216,7 @@ impl SplitContract {
         creator: Address,
         recipients: Vec<Address>,
         amounts: Vec<i128>,
-        token: Address,
+        tokens: Vec<Address>,
         months: u32,
     ) -> u64 {
         creator.require_auth();
@@ -211,9 +225,12 @@ impl SplitContract {
             recipients.len() == amounts.len(),
             "recipients and amounts length mismatch"
         );
+        assert!(
+            recipients.len() == tokens.len(),
+            "recipients and tokens length mismatch"
+        );
         assert!(!recipients.is_empty(), "must have at least one recipient");
         assert!(months > 0 && months <= 12, "months must be between 1 and 12");
-
         for amt in amounts.iter() {
             assert!(amt > 0, "amounts must be positive");
         }
@@ -224,7 +241,7 @@ impl SplitContract {
             creator.clone(),
             recipients.clone(),
             amounts.clone(),
-            token.clone(),
+            tokens.clone(),
             deadline,
             0,
             0,
@@ -236,7 +253,7 @@ impl SplitContract {
                 creator: creator.clone(),
                 recipients: recipients.clone(),
                 amounts: amounts.clone(),
-                token: token.clone(),
+                tokens: tokens.clone(),
             };
             env.storage()
                 .persistent()
@@ -255,6 +272,7 @@ impl SplitContract {
 
         let mut invoice = load_invoice(&env, invoice_id);
 
+        assert!(!invoice.frozen, "invoice is frozen");
         assert!(
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
@@ -292,6 +310,7 @@ impl SplitContract {
         let caller = env.current_contract_address();
         let mut invoice = load_invoice(&env, invoice_id);
 
+        assert!(!invoice.frozen, "invoice is frozen");
         assert!(
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
@@ -317,7 +336,9 @@ impl SplitContract {
             "deadline has not passed"
         );
 
-        let token_client = token::Client::new(&env, &invoice.token);
+        // Refund in the payment token (tokens[0])
+        let token_client =
+            token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
 
         // Aggregate total owed per unique payer (amount + tip).
         let mut totals: Map<Address, i128> = Map::new(&env);
@@ -461,6 +482,7 @@ impl SplitContract {
         };
         bytes.extend_from_array(&[s_byte]);
 
+        let bytes = Bytes::from_array(&env, &raw);
         let hash = env.crypto().sha256(&bytes).to_bytes();
 
         CompletionProof {
@@ -591,7 +613,14 @@ impl SplitContract {
     // -----------------------------------------------------------------------
 
     fn _release(env: &Env, invoice_id: u64, invoice: &mut Invoice, actor: &Address) {
-        let token_client = token::Client::new(env, &invoice.token);
+        let total: i128 = invoice.amounts.iter().sum();
+
+        // Deduct protocol fee from the payment token (tokens[0]) if configured.
+        let fee_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&fee_bps_key())
+            .unwrap_or(0u32);
 
         let contract_balance = token_client.balance(&env.current_contract_address());
         assert!(
@@ -655,7 +684,7 @@ impl SplitContract {
                 params.creator.clone(),
                 params.recipients.clone(),
                 params.amounts.clone(),
-                params.token.clone(),
+                params.tokens.clone(),
                 next_deadline,
                 0,
                 0,

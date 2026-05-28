@@ -80,6 +80,7 @@ fn test_create_invoice() {
     let invoice = c.get_invoice(&id);
     assert_eq!(invoice.status, InvoiceStatus::Pending);
     assert_eq!(invoice.funded, 0);
+    assert!(!invoice.frozen);
 }
 
 #[test]
@@ -305,6 +306,7 @@ fn test_create_subscription() {
     recipients.push_back(recipient.clone());
     let mut amounts = Vec::new(&env);
     amounts.push_back(200_i128);
+    let tokens = single_tokens(&env, &token_id);
 
     let id = c.create_subscription(&creator, &recipients, &amounts, &token_id, &3_u32);
     assert_eq!(id, 1);
