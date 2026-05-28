@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Symbol, Vec};
 
 /// Status of an invoice lifecycle.
 #[contracttype]

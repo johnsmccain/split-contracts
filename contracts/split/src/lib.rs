@@ -12,8 +12,8 @@ mod types;
 #[cfg(test)]
 mod test;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, BytesN, Env, Symbol, Vec};
-use types::{Invoice, InvoiceStatus, Payment, AuditEntry, SubscriptionParams, CompletionProof};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Bytes, Env, Symbol, Vec};
+use types::{AuditEntry, CompletionProof, Invoice, InvoiceStatus, Payment, SubscriptionParams};
 
 // ---------------------------------------------------------------------------
 // Storage helpers
@@ -42,42 +42,52 @@ fn save_invoice(env: &Env, id: u64, invoice: &Invoice) {
     env.storage().persistent().set(&invoice_key(id), invoice);
 }
 
-/// Storage key for the audit log: (symbol, invoice_id).
 fn audit_log_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("log"), id)
 }
 
-/// Storage key for subscription params: (symbol, parent_invoice_id).
 fn subscription_params_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("sub"), id)
 }
 
-/// Append an audit entry to the log for an invoice.
 fn append_audit_entry(env: &Env, id: u64, action: Symbol, actor: &Address) {
     let timestamp = env.ledger().timestamp();
-    let entry = AuditEntry {
-        action,
-        actor: actor.clone(),
-        timestamp,
-    };
-
-    // Try to load existing log, create new one if not present
+    let entry = AuditEntry { action, actor: actor.clone(), timestamp };
     let mut log: Vec<AuditEntry> = env
         .storage()
         .persistent()
         .get(&audit_log_key(id))
         .unwrap_or_else(|| Vec::new(env));
-
     log.push_back(entry);
     env.storage().persistent().set(&audit_log_key(id), &log);
 }
 
-/// Retrieve the audit log for an invoice.
 pub fn get_audit_log(env: &Env, id: u64) -> Vec<AuditEntry> {
     env.storage()
         .persistent()
         .get(&audit_log_key(id))
         .unwrap_or_else(|| Vec::new(env))
+}
+
+fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .persistent()
+        .get(&paused_key())
+        .unwrap_or(false)
+}
+
+fn require_not_paused(env: &Env) {
+    assert!(!is_paused(env), "contract is paused");
+}
+
+fn require_admin(env: &Env, caller: &Address) {
+    let admin: Address = env
+        .storage()
+        .persistent()
+        .get(&admin_key())
+        .expect("admin not set");
+    assert!(admin == *caller, "caller is not admin");
+    caller.require_auth();
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +142,7 @@ impl SplitContract {
         co_creators: Vec<Address>,
         allow_early_withdrawal: bool,
     ) -> u64 {
+        require_not_paused(&env);
         creator.require_auth();
 
         assert!(
@@ -143,6 +154,7 @@ impl SplitContract {
             deadline > env.ledger().timestamp(),
             "deadline must be in the future"
         );
+        assert!(bonus_pool >= 0, "bonus_pool must be non-negative");
 
         for amt in amounts.iter() {
             assert!(amt > 0, "amounts must be positive");
@@ -158,6 +170,12 @@ impl SplitContract {
 
         let total: i128 = amounts.iter().sum();
 
+        // Deposit bonus pool from creator if non-zero.
+        if bonus_pool > 0 {
+            let token_client = token::Client::new(&env, &token);
+            token_client.transfer(&creator, &env.current_contract_address(), &bonus_pool);
+        }
+
         let invoice = Invoice {
             creator: creator.clone(),
             co_creators,
@@ -172,25 +190,12 @@ impl SplitContract {
         };
 
         save_invoice(&env, id, &invoice);
-        events::invoice_created(&env, id, &creator, total);
+        events::invoice_created(&env, id, &creator, total, &metadata);
 
         id
     }
 
     /// Create a subscription chain of invoices for recurring monthly billing.
-    ///
-    /// Creates the first invoice immediately and schedules subsequent invoices
-    /// to be created automatically on each release.
-    ///
-    /// # Arguments
-    /// * `creator`    – address that owns the subscription (must authorise)
-    /// * `recipients` – ordered list of recipient addresses
-    /// * `amounts`    – amount owed to each recipient (parallel to `recipients`)
-    /// * `token`      – USDC token contract address
-    /// * `months`     – number of months (capped at 12)
-    ///
-    /// # Returns
-    /// The ID of the first invoice created.
     pub fn create_subscription(
         env: Env,
         creator: Address,
@@ -212,7 +217,6 @@ impl SplitContract {
             assert!(amt > 0, "amounts must be positive");
         }
 
-        // Create first invoice with deadline 30 days in future (in seconds)
         let deadline = env.ledger().timestamp() + 30 * 24 * 60 * 60;
         let id = Self::create_invoice(
             env.clone(),
@@ -221,9 +225,11 @@ impl SplitContract {
             amounts.clone(),
             token.clone(),
             deadline,
+            0,
+            0,
+            None,
         );
 
-        // Store subscription params if more invoices needed
         if months > 1 {
             let params = SubscriptionParams {
                 creator: creator.clone(),
@@ -241,6 +247,7 @@ impl SplitContract {
 
     /// Pay toward an invoice.
     pub fn pay(env: Env, payer: Address, invoice_id: u64, amount: i128) {
+        require_not_paused(&env);
         payer.require_auth();
 
         let mut invoice = load_invoice(&env, invoice_id);
@@ -262,17 +269,14 @@ impl SplitContract {
         let token_client = token::Client::new(&env, &invoice.token);
         token_client.transfer(&payer, &env.current_contract_address(), &amount);
 
-        invoice.payments.push_back(Payment {
-            payer: payer.clone(),
-            amount,
-        });
+        invoice.payments.push_back(Payment { payer: payer.clone(), amount });
         invoice.funded += amount;
 
         append_audit_entry(&env, invoice_id, symbol_short!("pay"), &payer);
         events::payment_received(&env, invoice_id, &payer, amount);
 
         if invoice.funded >= total {
-            Self::_release(&env, invoice_id, &mut invoice, &invoice.creator);
+            Self::_release(&env, invoice_id, &mut invoice, &invoice.creator.clone());
         } else {
             save_invoice(&env, invoice_id, &invoice);
         }
@@ -280,6 +284,7 @@ impl SplitContract {
 
     /// Release funds to all recipients once the invoice is fully funded.
     pub fn release(env: Env, invoice_id: u64) {
+        require_not_paused(&env);
         let caller = env.current_contract_address();
         let mut invoice = load_invoice(&env, invoice_id);
 
@@ -296,6 +301,7 @@ impl SplitContract {
 
     /// Refund all payers if the deadline has passed and the invoice is not fully funded.
     pub fn refund(env: Env, invoice_id: u64) {
+        require_not_paused(&env);
         let mut invoice = load_invoice(&env, invoice_id);
 
         assert!(
@@ -317,6 +323,15 @@ impl SplitContract {
             );
         }
 
+        // Refund unused bonus pool back to creator.
+        if invoice.bonus_pool > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &invoice.creator,
+                &invoice.bonus_pool,
+            );
+        }
+
         invoice.status = InvoiceStatus::Refunded;
         save_invoice(&env, invoice_id, &invoice);
         let actor = env.current_contract_address();
@@ -325,13 +340,8 @@ impl SplitContract {
     }
 
     /// Cancel an invoice before any payments are made.
-    ///
-    /// Only the creator can cancel, and it must be before payments start.
-    ///
-    /// # Arguments
-    /// * `caller`     – must be the invoice creator (must authorise)
-    /// * `invoice_id` – target invoice
     pub fn cancel_invoice(env: Env, caller: Address, invoice_id: u64) {
+        require_not_paused(&env);
         caller.require_auth();
 
         let mut invoice = load_invoice(&env, invoice_id);
@@ -340,29 +350,44 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
         );
-        assert!(
-            invoice.creator == caller,
-            "only creator can cancel"
-        );
-        assert!(
-            invoice.funded == 0,
-            "cannot cancel invoice with payments"
-        );
+        assert!(invoice.creator == caller, "only creator can cancel");
+        assert!(invoice.funded == 0, "cannot cancel invoice with payments");
+
+        // Refund bonus pool to creator on cancel.
+        if invoice.bonus_pool > 0 {
+            let token_client = token::Client::new(&env, &invoice.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &invoice.creator,
+                &invoice.bonus_pool,
+            );
+        }
 
         invoice.status = InvoiceStatus::Cancelled;
         save_invoice(&env, invoice_id, &invoice);
         append_audit_entry(&env, invoice_id, symbol_short!("cancel"), &caller);
     }
 
+    /// Transfer invoice ownership to a new creator.
+    ///
+    /// Only the current creator can call this, and the invoice must be Pending.
+    pub fn transfer_invoice(env: Env, invoice_id: u64, new_creator: Address) {
+        require_not_paused(&env);
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        assert!(
+            invoice.status == InvoiceStatus::Pending,
+            "invoice is not pending"
+        );
+
+        invoice.creator.require_auth();
+        invoice.creator = new_creator;
+        save_invoice(&env, invoice_id, &invoice);
+    }
+
     /// Extend the deadline for an invoice.
-    ///
-    /// Only the creator can extend, and the new deadline must be in the future.
-    ///
-    /// # Arguments
-    /// * `caller`     – must be the invoice creator (must authorise)
-    /// * `invoice_id` – target invoice
-    /// * `new_deadline` – new Unix timestamp for the deadline
     pub fn extend_deadline(env: Env, caller: Address, invoice_id: u64, new_deadline: u64) {
+        require_not_paused(&env);
         caller.require_auth();
 
         let mut invoice = load_invoice(&env, invoice_id);
@@ -371,10 +396,7 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
         );
-        assert!(
-            invoice.creator == caller,
-            "only creator can extend deadline"
-        );
+        assert!(invoice.creator == caller, "only creator can extend deadline");
         assert!(
             new_deadline > env.ledger().timestamp(),
             "new deadline must be in the future"
@@ -385,61 +407,41 @@ impl SplitContract {
         append_audit_entry(&env, invoice_id, symbol_short!("extend"), &caller);
     }
 
-    /// Retrieve an invoice by ID.
+    // -----------------------------------------------------------------------
+    // Read-only
+    // -----------------------------------------------------------------------
+
     pub fn get_invoice(env: Env, invoice_id: u64) -> Invoice {
         load_invoice(&env, invoice_id)
     }
 
-    /// Retrieve the audit log for an invoice.
     pub fn get_audit_log(env: Env, invoice_id: u64) -> Vec<AuditEntry> {
         get_audit_log(&env, invoice_id)
     }
 
     /// Generate a completion proof for a finalized invoice.
-    ///
-    /// Returns a proof containing ID, status, funded amount, timestamp,
-    /// and SHA-256 hash for off-chain verification.
-    ///
-    /// # Arguments
-    /// * `invoice_id` – target invoice
-    ///
-    /// # Returns
-    /// CompletionProof with invoice data and hash
     pub fn get_completion_proof(env: Env, invoice_id: u64) -> CompletionProof {
         let invoice = load_invoice(&env, invoice_id);
 
-        // Only return proof for finalized invoices
         assert!(
             invoice.status == InvoiceStatus::Released || invoice.status == InvoiceStatus::Refunded,
             "invoice not finalized"
         );
 
-        // Compute SHA-256 hash using binary serialization
         let mut bytes: Vec<u8> = Vec::new(&env);
-        // Serialize each field in a consistent order
-        // Creator
         bytes.extend_from_slice(&invoice.creator.to_bytes());
-        // Recipients count
         bytes.push(invoice.recipients.len() as u8);
         for r in invoice.recipients.iter() {
             bytes.extend_from_slice(&r.to_bytes());
         }
-        // Amounts
         bytes.push((invoice.amounts.len() & 0xFF) as u8);
         bytes.push(((invoice.amounts.len() >> 8) & 0xFF) as u8);
         for a in invoice.amounts.iter() {
-            let a_bytes = a.to_le_bytes();
-            bytes.extend_from_slice(&a_bytes);
+            bytes.extend_from_slice(&a.to_le_bytes());
         }
-        // Token
         bytes.extend_from_slice(&invoice.token.to_bytes());
-        // Deadline
-        let d_bytes = invoice.deadline.to_le_bytes();
-        bytes.extend_from_slice(&d_bytes);
-        // Funded
-        let f_bytes = invoice.funded.to_le_bytes();
-        bytes.extend_from_slice(&f_bytes);
-        // Status (Pending=0, Released=1, Refunded=2, Cancelled=3)
+        bytes.extend_from_slice(&invoice.deadline.to_le_bytes());
+        bytes.extend_from_slice(&invoice.funded.to_le_bytes());
         let s_byte = match invoice.status {
             InvoiceStatus::Pending => 0u8,
             InvoiceStatus::Released => 1u8,
@@ -577,8 +579,6 @@ impl SplitContract {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Route funds to all recipients and mark the invoice as released.
-    /// Also creates the next invoice in a subscription chain if params exist.
     fn _release(env: &Env, invoice_id: u64, invoice: &mut Invoice, actor: &Address) {
         let token_client = token::Client::new(env, &invoice.token);
 
@@ -592,29 +592,61 @@ impl SplitContract {
             token_client.transfer(&env.current_contract_address(), &recipient, &amount);
         }
 
+        // Distribute bonus pool equally among first `bonus_max_payers` unique payers.
+        if invoice.bonus_pool > 0 && invoice.bonus_max_payers > 0 {
+            // Collect unique payers in order of first appearance.
+            let mut unique_payers: Vec<Address> = Vec::new(env);
+            for payment in invoice.payments.iter() {
+                let already_seen = unique_payers.iter().any(|p| p == payment.payer);
+                if !already_seen {
+                    unique_payers.push_back(payment.payer.clone());
+                    if unique_payers.len() >= invoice.bonus_max_payers {
+                        break;
+                    }
+                }
+            }
+
+            if !unique_payers.is_empty() {
+                let n = unique_payers.len() as i128;
+                let per_payer = invoice.bonus_pool / n;
+                let mut distributed: i128 = 0;
+                for (i, payer) in unique_payers.iter().enumerate() {
+                    // Give remainder to last payer to avoid dust.
+                    let payout = if i as i128 == n - 1 {
+                        invoice.bonus_pool - distributed
+                    } else {
+                        per_payer
+                    };
+                    token_client.transfer(&env.current_contract_address(), &payer, &payout);
+                    distributed += payout;
+                }
+            }
+        }
+
         invoice.status = InvoiceStatus::Released;
         save_invoice(env, invoice_id, invoice);
         append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
         events::invoice_released(env, invoice_id, &invoice.recipients);
 
-        // Check for subscription params and create next invoice if exists
+        // Check for subscription params and create next invoice if exists.
         if let Some(params) = env
             .storage()
             .persistent()
             .get::<_, SubscriptionParams>(&subscription_params_key(invoice_id))
         {
-            // Create next invoice with deadline 30 days after current release
             let next_deadline = env.ledger().timestamp() + 30 * 24 * 60 * 60;
-            let next_id = Self::create_invoice(
+            let _next_id = Self::create_invoice(
                 env.clone(),
                 params.creator.clone(),
                 params.recipients.clone(),
                 params.amounts.clone(),
                 params.token.clone(),
                 next_deadline,
+                0,
+                0,
+                None,
             );
 
-            // Remove the params storage key (subscription complete)
             env.storage()
                 .persistent()
                 .remove(&subscription_params_key(invoice_id));
