@@ -427,6 +427,131 @@ fn test_audit_log_with_extend() {
 }
 
 // ---------------------------------------------------------------------------
+// Adjust split
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_adjust_split_updates_amounts_and_pays_new_total() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice: r1=100, r2=200 (total 300).
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    amounts.push_back(200_i128);
+    let id = c.create_invoice(
+        &creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env),
+    );
+
+    // Rebalance before any payment: r1=150, r2=250 (total 400).
+    let mut new_amounts = Vec::new(&env);
+    new_amounts.push_back(150_i128);
+    new_amounts.push_back(250_i128);
+    c.adjust_split(&creator, &id, &new_amounts);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.amounts.get_unchecked(0), 150);
+    assert_eq!(invoice.amounts.get_unchecked(1), 250);
+
+    // Pay the new total (400) and verify recipients receive updated amounts.
+    c.pay(&payer, &id, &400_i128, &0_u64);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&r1), 150);
+    assert_eq!(tk.balance(&r2), 250);
+}
+
+#[test]
+#[should_panic(expected = "only creator can adjust split")]
+fn test_adjust_split_non_creator_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let other = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let mut new_amounts = Vec::new(&env);
+    new_amounts.push_back(200_i128);
+    c.adjust_split(&other, &id, &new_amounts);
+}
+
+#[test]
+#[should_panic(expected = "payments already received")]
+fn test_adjust_split_after_payment_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &50);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.pay(&payer, &id, &50_i128, &0_u64);
+
+    let mut new_amounts = Vec::new(&env);
+    new_amounts.push_back(80_i128);
+    c.adjust_split(&creator, &id, &new_amounts);
+}
+
+#[test]
+#[should_panic(expected = "amounts length mismatch")]
+fn test_adjust_split_wrong_length_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Invoice has 1 recipient; pass 2 amounts.
+    let mut new_amounts = Vec::new(&env);
+    new_amounts.push_back(50_i128);
+    new_amounts.push_back(50_i128);
+    c.adjust_split(&creator, &id, &new_amounts);
+}
+
+#[test]
+#[should_panic(expected = "amounts must be positive")]
+fn test_adjust_split_zero_amount_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let mut new_amounts = Vec::new(&env);
+    new_amounts.push_back(0_i128);
+    c.adjust_split(&creator, &id, &new_amounts);
+}
+
+// ---------------------------------------------------------------------------
 // Add recipient
 // ---------------------------------------------------------------------------
 
@@ -1409,4 +1534,171 @@ fn test_creation_fee_charged_per_invoice_in_batch() {
 
     // 2 invoices x 10 fee = 20 total.
     assert_eq!(tk.balance(&treasury), 20);
+}
+
+// ---------------------------------------------------------------------------
+// adjust_split
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_adjust_split_updates_amounts_and_pays_new_total() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice: r1 = 100, r2 = 200 (total 300).
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    amounts.push_back(200_i128);
+    let id = c.create_invoice(
+        &creator,
+        &recipients,
+        &amounts,
+        &token_id,
+        &9_999_u64,
+        &default_options(&env),
+    );
+
+    // Adjust: r1 = 150, r2 = 350 (total 500).
+    let mut new_amounts = Vec::new(&env);
+    new_amounts.push_back(150_i128);
+    new_amounts.push_back(350_i128);
+    c.adjust_split(&creator, &id, &new_amounts);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.amounts.get_unchecked(0), 150);
+    assert_eq!(invoice.amounts.get_unchecked(1), 350);
+    assert_eq!(invoice.funded, 0);
+
+    // Pay the new total (500) and verify recipients receive updated amounts.
+    c.pay(&payer, &id, &500_i128, &0_u64);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&r1), 150);
+    assert_eq!(tk.balance(&r2), 350);
+}
+
+#[test]
+fn test_adjust_split_audit_entry() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let r1 = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &r1, 100, &token_id, 9_999);
+
+    let mut new_amounts = Vec::new(&env);
+    new_amounts.push_back(200_i128);
+    c.adjust_split(&creator, &id, &new_amounts);
+
+    let log = c.get_audit_log(&id);
+    assert_eq!(log.len(), 1);
+    assert_eq!(log.get_unchecked(0).action, symbol_short!("adj_spl"));
+    assert_eq!(log.get_unchecked(0).actor, creator);
+}
+
+#[test]
+#[should_panic(expected = "only creator can adjust split")]
+fn test_adjust_split_non_creator_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let other = Address::generate(&env);
+    let r1 = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &r1, 100, &token_id, 9_999);
+
+    let mut new_amounts = Vec::new(&env);
+    new_amounts.push_back(200_i128);
+    c.adjust_split(&other, &id, &new_amounts);
+}
+
+#[test]
+#[should_panic(expected = "payments already received")]
+fn test_adjust_split_after_payment_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let r1 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &r1, 300, &token_id, 9_999);
+    c.pay(&payer, &id, &50_i128, &0_u64);
+
+    let mut new_amounts = Vec::new(&env);
+    new_amounts.push_back(200_i128);
+    c.adjust_split(&creator, &id, &new_amounts);
+}
+
+#[test]
+#[should_panic(expected = "amounts length mismatch")]
+fn test_adjust_split_wrong_length_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Invoice has 2 recipients.
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    amounts.push_back(200_i128);
+    let id = c.create_invoice(
+        &creator,
+        &recipients,
+        &amounts,
+        &token_id,
+        &9_999_u64,
+        &default_options(&env),
+    );
+
+    // Pass only 1 amount — should panic.
+    let mut new_amounts = Vec::new(&env);
+    new_amounts.push_back(150_i128);
+    c.adjust_split(&creator, &id, &new_amounts);
+}
+
+#[test]
+#[should_panic(expected = "amounts must be positive")]
+fn test_adjust_split_zero_amount_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let r1 = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &r1, 100, &token_id, 9_999);
+
+    let mut new_amounts = Vec::new(&env);
+    new_amounts.push_back(0_i128);
+    c.adjust_split(&creator, &id, &new_amounts);
 }
