@@ -6,7 +6,7 @@ use soroban_sdk::{
     token::{Client as TokenClient, StellarAssetClient},
     Address, Env, Vec,
 };
-use types::{InvoiceOptions, Tranche};
+use types::InvoiceOptions;
 
 // ---------------------------------------------------------------------------
 // Test helpers

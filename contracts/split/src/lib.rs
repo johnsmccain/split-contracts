@@ -13,7 +13,7 @@ use soroban_sdk::{
 };
 use types::{
     AuditEntry, CompletionProof, CreateInvoiceParams, Invoice, InvoiceOptions, InvoiceStatus,
-    InvoiceTemplate, Payment, SubscriptionParams, Tranche,
+    InvoiceTemplate, LegacyInvoice, Payment, SubscriptionParams, Tranche,
 };
 
 // ---------------------------------------------------------------------------
@@ -188,6 +188,42 @@ impl SplitContract {
     }
 
     // -----------------------------------------------------------------------
+    // Schema migration
+    // -----------------------------------------------------------------------
+
+    /// Migrate a legacy (pre-version) invoice to the current schema.
+    ///
+    /// Reads the stored invoice under the old layout, rewrites it with
+    /// `version = 1` and all other fields preserved. Safe to call multiple
+    /// times — already-migrated invoices are a no-op. Requires admin auth.
+    pub fn migrate_invoice(env: Env, admin: Address, invoice_id: u64) {
+        require_admin(&env, &admin);
+
+        // Already migrated?
+        if let Some(invoice) = env
+            .storage()
+            .persistent()
+            .get::<_, Invoice>(&invoice_key(invoice_id))
+        {
+            if invoice.version >= 1 {
+                return;
+            }
+        }
+
+        // Read legacy format and upgrade.
+        let legacy: LegacyInvoice = env
+            .storage()
+            .persistent()
+            .get(&invoice_key(invoice_id))
+            .expect("invoice not found");
+
+        let invoice: Invoice = legacy.into();
+        env.storage()
+            .persistent()
+            .set(&invoice_key(invoice_id), &invoice);
+    }
+
+    // -----------------------------------------------------------------------
     // Invoice creation
     // -----------------------------------------------------------------------
 
@@ -286,6 +322,7 @@ impl SplitContract {
         }
 
         let invoice = Invoice {
+            version: 1u32,
             creator: creator.clone(),
             co_creators,
             recipients: recipients.clone(),
