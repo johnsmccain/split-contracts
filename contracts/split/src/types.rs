@@ -46,6 +46,15 @@ pub struct CompletionProof {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+pub struct PaymentProof {
+    pub invoice_id: u64,
+    pub payer: Address,
+    pub total_paid: i128,
+    pub proof_hash: BytesN<32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
 pub struct InvoiceTemplate {
     pub recipients: Vec<Address>,
     pub amounts: Vec<i128>,
@@ -87,6 +96,12 @@ pub struct InvoiceOptions {
     pub co_signers: Vec<Address>,
     /// How many co-signer approvals are needed (≤ `co_signers.len()`).
     pub required_signatures: u32,
+    /// Penalty basis points for late payments (issue #42).
+    pub penalty_bps: Option<u32>,
+    /// Soft deadline timestamp; payments after this incur a penalty (issue #42).
+    pub penalty_deadline: Option<u64>,
+    /// Minimum funding threshold in basis points (issue #43).
+    pub min_funding_bps: Option<u32>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -115,6 +130,8 @@ pub struct LegacyInvoice {
     pub prerequisite_id: Option<u64>,
     pub tranches: Vec<Tranche>,
     pub released_bps: u32,
+    pub stake_amount: i128,
+    pub referrer: Option<Address>,
 }
 
 #[contracttype]
@@ -159,6 +176,12 @@ pub struct Invoice {
     pub approver: Option<Address>,
     /// Whether the approver has approved the invoice (issue #25).
     pub approved: bool,
+    /// Penalty basis points for payments after `penalty_deadline` (issue #42).
+    pub penalty_bps: u32,
+    /// Soft deadline; payments after this timestamp incur a penalty (issue #42).
+    pub penalty_deadline: u64,
+    /// Minimum funding threshold in basis points (issue #43); 0 means 100%.
+    pub min_funding_bps: u32,
 }
 
 impl Invoice {
@@ -192,6 +215,9 @@ impl Invoice {
             signatures: Vec::new(env),
             approver: None,
             approved: false,
+            penalty_bps: 0,
+            penalty_deadline: 0,
+            min_funding_bps: 0,
         }
     }
 }
