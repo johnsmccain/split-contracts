@@ -45,3 +45,11 @@ pub fn recipient_added(env: &Env, invoice_id: u64, recipient: &Address, amount: 
         (recipient.clone(), amount),
     );
 }
+
+/// Emitted when the creator adjusts recipient split amounts.
+pub fn split_adjusted(env: &Env, invoice_id: u64, creator: &Address) {
+    env.events().publish(
+        (symbol_short!("adj_spl"), invoice_id),
+        creator.clone(),
+    );
+}

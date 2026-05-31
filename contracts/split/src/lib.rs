@@ -1358,6 +1358,45 @@ impl SplitContract {
     }
 
     // -----------------------------------------------------------------------
+    // Adjust split
+    // -----------------------------------------------------------------------
+
+    /// Update recipient amounts before any payment has been received.
+    ///
+    /// Only the creator may call this. Panics if any payment has already been
+    /// made (`invoice.funded > 0`). The length of `new_amounts` must match the
+    /// current number of recipients, and every amount must be positive.
+    pub fn adjust_split(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        new_amounts: Vec<i128>,
+    ) {
+        require_not_paused(&env);
+        caller.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        assert!(
+            invoice.status == InvoiceStatus::Pending,
+            "invoice is not pending"
+        );
+        assert!(invoice.creator == caller, "only creator can adjust split");
+        assert!(invoice.funded == 0, "payments already received");
+        assert!(
+            new_amounts.len() == invoice.recipients.len(),
+            "amounts length mismatch"
+        );
+        for amt in new_amounts.iter() {
+            assert!(amt > 0, "amounts must be positive");
+        }
+
+        invoice.amounts = new_amounts;
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("adj_spl"), &caller);
+    }
+
+    // -----------------------------------------------------------------------
     // Add recipient
     // -----------------------------------------------------------------------
 
@@ -1404,6 +1443,46 @@ impl SplitContract {
             .unwrap_or_else(|| Vec::new(&env));
         ids.push_back(invoice_id);
         env.storage().persistent().set(&key, &ids);
+    }
+
+    // -----------------------------------------------------------------------
+    // Adjust split
+    // -----------------------------------------------------------------------
+
+    /// Rebalance recipient amounts before any payment has been received.
+    ///
+    /// Only the creator may call this. Panics if any payment has already been
+    /// made (`invoice.funded > 0`). The length of `new_amounts` must match the
+    /// existing number of recipients, and every amount must be positive.
+    pub fn adjust_split(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        new_amounts: Vec<i128>,
+    ) {
+        require_not_paused(&env);
+        caller.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        assert!(
+            invoice.status == InvoiceStatus::Pending,
+            "invoice is not pending"
+        );
+        assert!(invoice.creator == caller, "only creator can adjust split");
+        assert!(invoice.funded == 0, "payments already received");
+        assert!(
+            new_amounts.len() == invoice.recipients.len(),
+            "amounts length mismatch"
+        );
+        for amt in new_amounts.iter() {
+            assert!(amt > 0, "amounts must be positive");
+        }
+
+        invoice.amounts = new_amounts;
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("adj_spl"), &caller);
+        events::split_adjusted(&env, invoice_id, &caller);
     }
 
     // -----------------------------------------------------------------------
