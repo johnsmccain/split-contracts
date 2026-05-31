@@ -116,6 +116,8 @@ pub struct InvoiceOptions {
     /// Issue #86: creator-triggered staged release schedule; each entry is
     /// basis points (must sum to 10 000 when non-empty).
     pub release_stages: Vec<u32>,
+    /// Issue #142: optional price oracle contract for dynamic pricing.
+    pub price_oracle: Option<Address>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -200,6 +202,12 @@ pub struct Invoice {
     pub release_stages: Vec<u32>,
     /// Issue #86: number of stages already released.
     pub released_stages: u32,
+    /// Optional whitelist of addresses allowed to pay this invoice (mirrors InvoiceTemplate).
+    pub allowed_payers: Option<Vec<Address>>,
+    /// Issue #142: optional price oracle contract; when set, pay() queries it for the current price.
+    pub price_oracle: Option<Address>,
+    /// Issue #142: base amounts recorded at creation; used to compute oracle-adjusted totals.
+    pub base_amounts: Vec<i128>,
 }
 
 impl Invoice {
@@ -211,6 +219,7 @@ impl Invoice {
             creator: old.creator,
             co_creators: old.co_creators,
             recipients: old.recipients,
+            base_amounts: old.amounts.clone(),
             amounts: old.amounts,
             tokens: old.tokens,
             deadline: old.deadline,
@@ -238,6 +247,8 @@ impl Invoice {
             min_funding_bps: 0,
             release_stages: Vec::new(env),
             released_stages: 0,
+            allowed_payers: None,
+            price_oracle: None,
         }
     }
 }

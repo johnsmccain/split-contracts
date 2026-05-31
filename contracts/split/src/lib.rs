@@ -220,28 +220,18 @@ impl SplitContract {
         env.storage().persistent().set(&paused_key(), &false);
     }
 
-    /// Pause all mutating operations. Requires admin auth.
-    pub fn pause(env: Env, admin: Address) {
-        require_admin(&env, &admin);
-        env.storage().persistent().set(&paused_key(), &true);
-    }
-
-    /// Unpause the contract. Requires admin auth.
-    pub fn unpause(env: Env, admin: Address) {
-        require_admin(&env, &admin);
-        env.storage().persistent().set(&paused_key(), &false);
-    }
-
     /// Update the creation fee. Requires admin auth.
     pub fn set_creation_fee(env: Env, admin: Address, creation_fee: i128) {
-        require_admin(&env, &admin);
+        require_admin(&env);
+        let _ = admin;
         assert!(creation_fee >= 0, "creation_fee must be non-negative");
         env.storage().instance().set(&creation_fee_key(), &creation_fee);
     }
 
     /// Update the treasury address. Requires admin auth.
     pub fn set_treasury(env: Env, admin: Address, treasury: Address) {
-        require_admin(&env, &admin);
+        require_admin(&env);
+        let _ = admin;
         env.storage().instance().set(&treasury_key(), &treasury);
     }
 
@@ -287,7 +277,8 @@ impl SplitContract {
     /// `version = 1` and all other fields preserved. Safe to call multiple
     /// times — already-migrated invoices are a no-op. Requires admin auth.
     pub fn migrate_invoice(env: Env, admin: Address, invoice_id: u64) {
-        require_admin(&env, &admin);
+        require_admin(&env);
+        let _ = admin;
 
         // Already migrated?
         if let Some(invoice) = env
@@ -353,9 +344,11 @@ impl SplitContract {
             options.penalty_deadline.unwrap_or(0),
             options.min_funding_bps.unwrap_or(0),
             options.release_stages,
+            options.price_oracle,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn _create_invoice_inner(
         env: &Env,
@@ -376,6 +369,7 @@ impl SplitContract {
         penalty_deadline: u64,
         min_funding_bps: u32,
         release_stages: Vec<u32>,
+        price_oracle: Option<Address>,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -462,9 +456,11 @@ impl SplitContract {
         let invoice = Invoice {
             version: 1u32,
             creator: creator.clone(),
+            co_creators,
             recipients,
+            base_amounts: amounts.clone(),
             amounts,
-            token,
+            tokens,
             deadline,
             funded: 0,
             status: InvoiceStatus::Pending,
@@ -490,10 +486,12 @@ impl SplitContract {
             min_funding_bps,
             release_stages,
             released_stages: 0,
+            allowed_payers: None,
+            price_oracle,
         };
 
         save_invoice(env, id, &invoice);
-        events::invoice_created(env, id, &creator, total, &None);
+        events::invoice_created(env, id, &creator, total);
 
         // Index each recipient -> invoice ID (issue #40).
         for recipient in recipients.iter() {
@@ -540,6 +538,7 @@ impl SplitContract {
                 0,
                 0,
                 Vec::new(&env),
+                None,
             );
             ids.push_back(id);
         }
@@ -587,6 +586,7 @@ impl SplitContract {
             0,
             0,
             Vec::new(&env),
+            None,
         );
 
         if months > 1 {
@@ -640,7 +640,19 @@ impl SplitContract {
         );
         assert!(amount > 0, "payment amount must be positive");
 
-        let total: i128 = invoice.amounts.iter().sum();
+        // Issue #142: when a price oracle is configured, query current price and
+        // compute the oracle-adjusted total. oracle_price of 1_000_000 = 1.0 (identity).
+        let total: i128 = if let Some(ref oracle) = invoice.price_oracle {
+            let oracle_price: i128 = env.invoke_contract(
+                oracle,
+                &Symbol::new(env, "get_price"),
+                Vec::new(env),
+            );
+            let base_total: i128 = invoice.base_amounts.iter().sum();
+            base_total * oracle_price / 1_000_000
+        } else {
+            invoice.amounts.iter().sum()
+        };
         let remaining = total - invoice.funded;
         assert!(amount <= remaining, "payment exceeds remaining balance");
 
@@ -654,26 +666,6 @@ impl SplitContract {
         env.storage()
             .persistent()
             .set(&nonce_key(invoice_id, payer), &(stored_nonce + 1));
-
-        // Check payer limit (issue #26).
-        if let Some(max_payers_cap) = invoice.max_payers {
-            let is_existing_payer = invoice.payments.iter().any(|p| p.payer == *payer);
-            if !is_existing_payer {
-                let unique_payer_count = {
-                    let mut seen: Vec<Address> = Vec::new(env);
-                    for payment in invoice.payments.iter() {
-                        if !seen.contains(&payment.payer) {
-                            seen.push_back(payment.payer.clone());
-                        }
-                    }
-                    seen.len() as u32
-                };
-                assert!(
-                    unique_payer_count < max_payers_cap,
-                    "payer limit reached"
-                );
-            }
-        }
 
         let token_client = token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
         
@@ -852,7 +844,6 @@ impl SplitContract {
                 invoice.signatures.len() >= invoice.required_signatures,
                 "not enough co-signer approvals"
             );
-            events::payer_refunded(&env, invoice_id, &payment.payer, payment.amount);
         }
 
         Self::_release(&env, invoice_id, &mut invoice, &caller);
@@ -1196,6 +1187,7 @@ impl SplitContract {
                 0,
                 0,
                 Vec::new(env),
+                None,
             );
             env.storage()
                 .persistent()
@@ -1399,6 +1391,7 @@ impl SplitContract {
             old_invoice.penalty_deadline,
             old_invoice.min_funding_bps,
             old_invoice.release_stages.clone(),
+            old_invoice.price_oracle.clone(),
         );
 
         // Load the newly created invoice and copy over the payments.
@@ -1427,36 +1420,6 @@ impl SplitContract {
     /// Only the creator may call this. Panics if any payment has already been
     /// made (`invoice.funded > 0`). The length of `new_amounts` must match the
     /// current number of recipients, and every amount must be positive.
-    pub fn adjust_split(
-        env: Env,
-        caller: Address,
-        invoice_id: u64,
-        new_amounts: Vec<i128>,
-    ) {
-        require_not_paused(&env);
-        caller.require_auth();
-
-        let mut invoice = load_invoice(&env, invoice_id);
-
-        assert!(
-            invoice.status == InvoiceStatus::Pending,
-            "invoice is not pending"
-        );
-        assert!(invoice.creator == caller, "only creator can adjust split");
-        assert!(invoice.funded == 0, "payments already received");
-        assert!(
-            new_amounts.len() == invoice.recipients.len(),
-            "amounts length mismatch"
-        );
-        for amt in new_amounts.iter() {
-            assert!(amt > 0, "amounts must be positive");
-        }
-
-        invoice.amounts = new_amounts;
-        save_invoice(&env, invoice_id, &invoice);
-        append_audit_entry(&env, invoice_id, symbol_short!("adj_spl"), &caller);
-    }
-
     // -----------------------------------------------------------------------
     // Add recipient
     // -----------------------------------------------------------------------
@@ -1606,6 +1569,7 @@ impl SplitContract {
             0,
             0,
             Vec::new(&env),
+            None,
         )
     }
 

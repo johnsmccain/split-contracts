@@ -49,6 +49,7 @@ fn default_options(env: &Env) -> InvoiceOptions {
             penalty_deadline: None,
             min_funding_bps: None,
             release_stages: Vec::new(env),
+            price_oracle: None,
         }
     }
 
@@ -2761,4 +2762,168 @@ fn test_create_invoice_invalid_release_stages_panics() {
     opts.release_stages = stages;
 
     c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #142 — dynamic pricing via price oracle
+// ---------------------------------------------------------------------------
+
+/// Minimal price oracle contract used by oracle tests.
+#[contract]
+struct MockOracle;
+
+#[contractimpl]
+impl MockOracle {
+    /// Returns a fixed price of 2.0 (2_000_000 in 6-decimal fixed-point).
+    pub fn get_price(_env: Env) -> i128 {
+        2_000_000
+    }
+}
+
+/// A 1.0 oracle (1_000_000) must produce the same amounts as no oracle.
+#[contract]
+struct IdentityOracle;
+
+#[contractimpl]
+impl IdentityOracle {
+    pub fn get_price(_env: Env) -> i128 {
+        1_000_000
+    }
+}
+
+#[test]
+fn test_oracle_none_behaviour_identical_to_current() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    tk.mint(&payer, &1_000);
+
+    // Create invoice with no oracle (None) — base amount 100.
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let invoice = c.get_invoice(&id);
+    assert!(invoice.price_oracle.is_none());
+    assert_eq!(invoice.base_amounts.get(0).unwrap(), 100);
+
+    // Full payment of 100 should succeed (no oracle adjustment).
+    c.pay(&payer, &id, &100, &0, &false);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.funded, 100);
+    assert_eq!(invoice.status, InvoiceStatus::Released);
+}
+
+#[test]
+fn test_oracle_price_1_000_000_produces_same_amounts_as_base() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    tk.mint(&payer, &200);
+
+    // Register oracle that returns 1_000_000 (identity).
+    let oracle_id = env.register(IdentityOracle, ());
+
+    let mut opts = default_options(&env);
+    opts.price_oracle = Some(oracle_id);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999, &opts);
+
+    let invoice = c.get_invoice(&id);
+    assert!(invoice.price_oracle.is_some());
+    assert_eq!(invoice.base_amounts.get(0).unwrap(), 100);
+
+    // adjusted_total = 100 * 1_000_000 / 1_000_000 = 100 — identical to base
+    c.pay(&payer, &id, &100, &0, &false);
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.funded, 100);
+    assert_eq!(invoice.status, InvoiceStatus::Released);
+}
+
+#[test]
+fn test_oracle_2x_price_doubles_required_amount() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    tk.mint(&payer, &400);
+
+    // Register mock oracle returning 2_000_000 (2x price).
+    let oracle_id = env.register(MockOracle, ());
+
+    let mut opts = default_options(&env);
+    opts.price_oracle = Some(oracle_id);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128); // base amount
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999, &opts);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.base_amounts.get(0).unwrap(), 100);
+
+    // adjusted_total = 100 * 2_000_000 / 1_000_000 = 200
+    // Paying only 100 should NOT release (remaining = 200 - 100 = 100 still owed).
+    c.pay(&payer, &id, &100, &0, &false);
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.funded, 100);
+    assert_eq!(invoice.status, InvoiceStatus::Pending); // not yet fully funded
+
+    // Paying the remaining 100 (total 200 = adjusted_total) should release.
+    c.pay(&payer, &id, &100, &1, &false);
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.funded, 200);
+    assert_eq!(invoice.status, InvoiceStatus::Released);
+}
+
+#[test]
+fn test_create_invoice_stores_price_oracle_and_base_amounts() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let oracle_id = env.register(MockOracle, ());
+    let mut opts = default_options(&env);
+    opts.price_oracle = Some(oracle_id.clone());
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(500_i128);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999, &opts);
+    let invoice = c.get_invoice(&id);
+
+    assert_eq!(invoice.price_oracle, Some(oracle_id));
+    assert_eq!(invoice.base_amounts.len(), 1);
+    assert_eq!(invoice.base_amounts.get(0).unwrap(), 500);
+    // amounts field also preserved
+    assert_eq!(invoice.amounts.get(0).unwrap(), 500);
 }
