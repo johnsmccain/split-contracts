@@ -88,6 +88,20 @@ fn recipient_invoice_ids_key(recipient: &Address) -> (Symbol, Address) {
     (symbol_short!("rec_inv"), recipient.clone())
 }
 
+/// Analytics counters (issue #28).
+fn total_invoices_key() -> Symbol {
+    symbol_short!("tot_inv")
+}
+fn total_volume_key() -> Symbol {
+    symbol_short!("tot_vol")
+}
+fn total_released_key() -> Symbol {
+    symbol_short!("tot_rel")
+}
+fn total_refunded_key() -> Symbol {
+    symbol_short!("tot_ref")
+}
+
 // ---------------------------------------------------------------------------
 // Invoice storage helpers
 // ---------------------------------------------------------------------------
@@ -504,6 +518,17 @@ impl SplitContract {
             ids.push_back(id);
             env.storage().persistent().set(&key, &ids);
         }
+
+        // Increment total_invoices counter (issue #28).
+        let total_invoices: u64 = env
+            .storage()
+            .persistent()
+            .get(&total_invoices_key())
+            .unwrap_or(0u64);
+        env.storage().persistent().set(
+            &total_invoices_key(),
+            &total_invoices.checked_add(1).expect("total_invoices overflow"),
+        );
 
         id
     }
@@ -929,6 +954,32 @@ impl SplitContract {
 
         invoice.released_bps += new_bps;
 
+        // Calculate amount released in this tranche call.
+        let amount_released = ((funded as u128)
+            .saturating_mul(new_bps as u128)
+            / 10_000u128) as i128;
+
+        // Increment total_volume and total_released counters (issue #28).
+        let total_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&total_volume_key())
+            .unwrap_or(0i128);
+        env.storage().persistent().set(
+            &total_volume_key(),
+            &total_volume.checked_add(amount_released).expect("total_volume overflow"),
+        );
+
+        let total_released: i128 = env
+            .storage()
+            .persistent()
+            .get(&total_released_key())
+            .unwrap_or(0i128);
+        env.storage().persistent().set(
+            &total_released_key(),
+            &total_released.checked_add(amount_released).expect("total_released overflow"),
+        );
+
         if invoice.released_bps >= 10_000 {
             invoice.status = InvoiceStatus::Released;
             invoice.completion_time = Some(now);
@@ -1010,6 +1061,32 @@ impl SplitContract {
         }
 
         invoice.released_stages += 1;
+
+        // Calculate amount released in this stage.
+        let amount_released = ((stage_bps as u128)
+            .saturating_mul(funded as u128)
+            / 10_000u128) as i128;
+
+        // Increment total_volume and total_released counters (issue #28).
+        let total_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&total_volume_key())
+            .unwrap_or(0i128);
+        env.storage().persistent().set(
+            &total_volume_key(),
+            &total_volume.checked_add(amount_released).expect("total_volume overflow"),
+        );
+
+        let total_released: i128 = env
+            .storage()
+            .persistent()
+            .get(&total_released_key())
+            .unwrap_or(0i128);
+        env.storage().persistent().set(
+            &total_released_key(),
+            &total_released.checked_add(amount_released).expect("total_released overflow"),
+        );
 
         let now = env.ledger().timestamp();
         if invoice.released_stages >= invoice.release_stages.len() {
@@ -1160,6 +1237,27 @@ impl SplitContract {
         append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
         events::invoice_released(env, invoice_id, &invoice.recipients);
 
+        // Increment total_volume and total_released counters (issue #28).
+        let total_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&total_volume_key())
+            .unwrap_or(0i128);
+        env.storage().persistent().set(
+            &total_volume_key(),
+            &total_volume.checked_add(funded).expect("total_volume overflow"),
+        );
+
+        let total_released: i128 = env
+            .storage()
+            .persistent()
+            .get(&total_released_key())
+            .unwrap_or(0i128);
+        env.storage().persistent().set(
+            &total_released_key(),
+            &total_released.checked_add(funded).expect("total_released overflow"),
+        );
+
         // Spin up next subscription invoice if one is scheduled.
         if let Some(params) = env
             .storage()
@@ -1222,8 +1320,10 @@ impl SplitContract {
             totals.set(payment.payer.clone(), prev + payment.amount);
         }
 
+        let mut total_refunded_amount: i128 = 0;
         for (payer, amount) in totals.iter() {
             token_client.transfer(&env.current_contract_address(), &payer, &amount);
+            total_refunded_amount += amount;
             events::payer_refunded(&env, invoice_id, &payer, amount);
         }
 
@@ -1241,6 +1341,17 @@ impl SplitContract {
         let actor = env.current_contract_address();
         append_audit_entry(&env, invoice_id, symbol_short!("refund"), &actor);
         events::invoice_refunded(&env, invoice_id);
+
+        // Increment total_refunded counter (issue #28).
+        let total_refunded: i128 = env
+            .storage()
+            .persistent()
+            .get(&total_refunded_key())
+            .unwrap_or(0i128);
+        env.storage().persistent().set(
+            &total_refunded_key(),
+            &total_refunded.checked_add(total_refunded_amount).expect("total_refunded overflow"),
+        );
     }
 
     /// Cancel an invoice. Refunds any payments already made.
@@ -1267,12 +1378,14 @@ impl SplitContract {
                 let prev = totals.get(payment.payer.clone()).unwrap_or(0);
                 totals.set(payment.payer.clone(), prev + payment.amount);
             }
-            
+
             // Issue #89: Distribute stake equally among unique payers if stake exists.
             // (stake_amount field not yet on Invoice; skipped)
 
+            let mut total_refunded_amount: i128 = 0;
             for (payer, amount) in totals.iter() {
                 token_client.transfer(&env.current_contract_address(), &payer, &amount);
+                total_refunded_amount += amount;
             }
 
             if invoice.bonus_pool > 0 {
@@ -1284,6 +1397,17 @@ impl SplitContract {
             }
 
             invoice.status = InvoiceStatus::Refunded;
+
+            // Increment total_refunded counter (issue #28).
+            let total_refunded: i128 = env
+                .storage()
+                .persistent()
+                .get(&total_refunded_key())
+                .unwrap_or(0i128);
+            env.storage().persistent().set(
+                &total_refunded_key(),
+                &total_refunded.checked_add(total_refunded_amount).expect("total_refunded overflow"),
+            );
         } else {
             if invoice.bonus_pool > 0 {
                 let token_client =
@@ -1893,5 +2017,33 @@ impl SplitContract {
             .persistent()
             .get(&referral_count_key(&referrer))
             .unwrap_or(0u64)
+    }
+
+    /// Return the contract-level analytics counters (issue #28).
+    ///
+    /// Returns a tuple of (total_invoices, total_volume, total_released, total_refunded).
+    /// Each counter starts at 0 and increments on the relevant state change.
+    pub fn get_stats(env: Env) -> (u64, i128, i128, i128) {
+        let total_invoices = env
+            .storage()
+            .persistent()
+            .get(&total_invoices_key())
+            .unwrap_or(0u64);
+        let total_volume = env
+            .storage()
+            .persistent()
+            .get(&total_volume_key())
+            .unwrap_or(0i128);
+        let total_released = env
+            .storage()
+            .persistent()
+            .get(&total_released_key())
+            .unwrap_or(0i128);
+        let total_refunded = env
+            .storage()
+            .persistent()
+            .get(&total_refunded_key())
+            .unwrap_or(0i128);
+        (total_invoices, total_volume, total_released, total_refunded)
     }
 }

@@ -2927,3 +2927,199 @@ fn test_create_invoice_stores_price_oracle_and_base_amounts() {
     // amounts field also preserved
     assert_eq!(invoice.amounts.get(0).unwrap(), 500);
 }
+
+// ---------------------------------------------------------------------------
+// Analytics counters (issue #28)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_analytics_initial_state() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let (total_invoices, total_volume, total_released, total_refunded) = c.get_stats();
+    assert_eq!(total_invoices, 0);
+    assert_eq!(total_volume, 0);
+    assert_eq!(total_released, 0);
+    assert_eq!(total_refunded, 0);
+}
+
+#[test]
+fn test_analytics_create_invoice_increments_counter() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create first invoice
+    make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let (total_invoices, total_volume, total_released, total_refunded) = c.get_stats();
+    assert_eq!(total_invoices, 1);
+    assert_eq!(total_volume, 0);
+    assert_eq!(total_released, 0);
+    assert_eq!(total_refunded, 0);
+
+    // Create second invoice
+    make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    let (total_invoices, total_volume, total_released, total_refunded) = c.get_stats();
+    assert_eq!(total_invoices, 2);
+    assert_eq!(total_volume, 0);
+    assert_eq!(total_released, 0);
+    assert_eq!(total_refunded, 0);
+}
+
+#[test]
+fn test_analytics_pay_and_release_increments_volume() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let invoice_amount = 250i128;
+    let id = make_invoice(&env, &c, &creator, &recipient, invoice_amount, &token_id, 9_999);
+
+    // Pay and auto-release (full payment)
+    c.pay(&payer, &id, &invoice_amount, &0_u64, &false);
+
+    let (total_invoices, total_volume, total_released, total_refunded) = c.get_stats();
+    assert_eq!(total_invoices, 1);
+    assert_eq!(total_volume, invoice_amount);
+    assert_eq!(total_released, invoice_amount);
+    assert_eq!(total_refunded, 0);
+    assert_eq!(tk.balance(&recipient), invoice_amount);
+}
+
+#[test]
+fn test_analytics_partial_pay_then_release() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer1, &200);
+    sa.mint(&payer2, &200);
+    env.ledger().set_timestamp(1_000);
+
+    let total_amount = 300i128;
+    let id = make_invoice(&env, &c, &creator, &recipient, total_amount, &token_id, 9_999);
+
+    // Partial payment from payer1
+    c.pay(&payer1, &id, &150_i128, &0_u64, &false);
+    let (total_invoices, total_volume, total_released, total_refunded) = c.get_stats();
+    assert_eq!(total_invoices, 1);
+    assert_eq!(total_volume, 0);
+    assert_eq!(total_released, 0);
+    assert_eq!(total_refunded, 0);
+
+    // Completion payment from payer2 triggers auto-release
+    c.pay(&payer2, &id, &150_i128, &0_u64, &false);
+    let (total_invoices, total_volume, total_released, total_refunded) = c.get_stats();
+    assert_eq!(total_invoices, 1);
+    assert_eq!(total_volume, 300);
+    assert_eq!(total_released, 300);
+    assert_eq!(total_refunded, 0);
+    assert_eq!(tk.balance(&recipient), 300);
+}
+
+#[test]
+fn test_analytics_refund_increments_counter() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let invoice_amount = 200i128;
+    let id = make_invoice(&env, &c, &creator, &recipient, invoice_amount, &token_id, 2_000);
+
+    // Pay but don't complete
+    c.pay(&payer, &id, &100_i128, &0_u64, &false);
+
+    let (total_invoices, total_volume, total_released, total_refunded) = c.get_stats();
+    assert_eq!(total_invoices, 1);
+    assert_eq!(total_volume, 0);
+    assert_eq!(total_released, 0);
+    assert_eq!(total_refunded, 0);
+
+    // Pass deadline and refund
+    env.ledger().set_timestamp(3_000);
+    c.refund(&id);
+
+    let (total_invoices, total_volume, total_released, total_refunded) = c.get_stats();
+    assert_eq!(total_invoices, 1);
+    assert_eq!(total_volume, 0);
+    assert_eq!(total_released, 0);
+    assert_eq!(total_refunded, 100);
+    assert_eq!(tk.balance(&payer), 100);
+}
+
+#[test]
+fn test_analytics_multiple_operations() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let recipient1 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer1, &1000);
+    sa.mint(&payer2, &1000);
+    env.ledger().set_timestamp(1_000);
+
+    // Create and release invoice 1
+    let id1 = make_invoice(&env, &c, &creator, &recipient1, 100, &token_id, 9_999);
+    c.pay(&payer1, &id1, &100_i128, &0_u64, &false);
+
+    let (ti, tv, tr, tref) = c.get_stats();
+    assert_eq!(ti, 1);
+    assert_eq!(tv, 100);
+    assert_eq!(tr, 100);
+    assert_eq!(tref, 0);
+
+    // Create invoice 2 and refund it
+    let id2 = make_invoice(&env, &c, &creator, &recipient2, 200, &token_id, 2_000);
+    c.pay(&payer2, &id2, &50_i128, &0_u64, &false);
+    env.ledger().set_timestamp(3_000);
+    c.refund(&id2);
+
+    let (ti, tv, tr, tref) = c.get_stats();
+    assert_eq!(ti, 2);
+    assert_eq!(tv, 100);
+    assert_eq!(tr, 100);
+    assert_eq!(tref, 50);
+
+    // Create invoice 3 and release it
+    let id3 = make_invoice(&env, &c, &creator, &recipient1, 300, &token_id, 9_999);
+    c.pay(&payer1, &id3, &300_i128, &0_u64, &false);
+
+    let (ti, tv, tr, tref) = c.get_stats();
+    assert_eq!(ti, 3);
+    assert_eq!(tv, 400);
+    assert_eq!(tr, 400);
+    assert_eq!(tref, 50);
+}
