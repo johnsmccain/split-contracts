@@ -59,6 +59,17 @@ pub struct InvoiceTemplate {
     pub recipients: Vec<Address>,
     pub amounts: Vec<i128>,
     pub token: Address,
+    /// Unix timestamp after which unfunded invoices can be refunded.
+    pub deadline: u64,
+    /// Total amount collected so far.
+    pub funded: i128,
+    /// Current lifecycle status.
+    pub status: InvoiceStatus,
+    /// All payments made toward this invoice.
+    pub payments: Vec<Payment>,
+    /// Optional whitelist of addresses allowed to pay this invoice.
+    /// When None, any address may pay.
+    pub allowed_payers: Option<Vec<Address>>,
 }
 
 #[contracttype]
@@ -102,12 +113,13 @@ pub struct InvoiceOptions {
     pub penalty_deadline: Option<u64>,
     /// Minimum funding threshold in basis points (issue #43).
     pub min_funding_bps: Option<u32>,
-    /// Stake amount from creator (issue #89).
-    pub stake_amount: i128,
-    /// Referrer address for referral tracking (issue #87).
-    pub referrer: Option<Address>,
-    /// Optional vesting cliff timestamp (issue #27); None means no cliff.
-    pub vesting_cliff: Option<u64>,
+    /// Issue #86: creator-triggered staged release schedule; each entry is
+    /// basis points (must sum to 10 000 when non-empty).
+    pub release_stages: Vec<u32>,
+    /// Issue #142: optional price oracle contract for dynamic pricing.
+    pub price_oracle: Option<Address>,
+    /// Issue #41: optional preferred output token per recipient for DEX swap on release.
+    pub swap_tokens: Vec<Option<Address>>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -188,14 +200,19 @@ pub struct Invoice {
     pub penalty_deadline: u64,
     /// Minimum funding threshold in basis points (issue #43); 0 means 100%.
     pub min_funding_bps: u32,
-    /// Stake amount (issue #89).
-    pub stake_amount: i128,
-    /// Referrer address (issue #87).
-    pub referrer: Option<Address>,
-    /// Optional vesting cliff timestamp (issue #27); None means no cliff.
-    pub vesting_cliff: Option<u64>,
-    /// Tracks which recipients have claimed after vesting cliff (parallel to recipients).
-    pub vesting_cliff_claimed: Vec<bool>,
+    /// Issue #86: creator-triggered staged release schedule (basis points per stage).
+    pub release_stages: Vec<u32>,
+    /// Issue #86: number of stages already released.
+    pub released_stages: u32,
+    /// Optional whitelist of addresses allowed to pay this invoice (mirrors InvoiceTemplate).
+    pub allowed_payers: Option<Vec<Address>>,
+    /// Issue #142: optional price oracle contract; when set, pay() queries it for the current price.
+    pub price_oracle: Option<Address>,
+    /// Issue #142: base amounts recorded at creation; used to compute oracle-adjusted totals.
+    pub base_amounts: Vec<i128>,
+    /// Issue #41: optional preferred output token per recipient for DEX swap on release.
+    /// Parallel to `recipients`; None means pay in the invoice token as normal.
+    pub swap_tokens: Vec<Option<Address>>,
 }
 
 impl Invoice {
@@ -213,6 +230,7 @@ impl Invoice {
             creator: old.creator,
             co_creators: old.co_creators,
             recipients: old.recipients,
+            base_amounts: old.amounts.clone(),
             amounts: old.amounts,
             tokens: old.tokens,
             deadline: old.deadline,
@@ -238,10 +256,11 @@ impl Invoice {
             penalty_bps: 0,
             penalty_deadline: 0,
             min_funding_bps: 0,
-            stake_amount: old.stake_amount,
-            referrer: old.referrer,
-            vesting_cliff: None,
-            vesting_cliff_claimed,
+            release_stages: Vec::new(env),
+            released_stages: 0,
+            allowed_payers: None,
+            price_oracle: None,
+            swap_tokens: Vec::new(env),
         }
     }
 }

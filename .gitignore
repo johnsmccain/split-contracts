@@ -24,6 +24,7 @@ Thumbs.db
 # Test snapshots
 **/__snapshots__/
 *.snap
+**/test_snapshots/
 
 # Stellar CLI
 .stellar/
@@ -31,3 +32,12 @@ identity/
 
 # Logs
 *.log
+
+# Coverage reports
+lcov.info
+tarpaulin-report.html
+coverage/
+
+# Temporary files
+*.tmp
+*.bak
