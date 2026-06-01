@@ -12,8 +12,9 @@ use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env, Map, Symbol, Vec,
 };
 use types::{
-    AuditEntry, CompletionProof, CreateInvoiceParams, Invoice, InvoiceOptions, InvoiceStatus,
-    InvoiceTemplate, LegacyInvoice, Payment, PaymentProof, SubscriptionParams, Tranche,
+    AuditEntry, CompletionProof, CreateInvoiceParams, Invoice, InvoiceOptions, InvoiceStats,
+    InvoiceStatus, InvoiceTemplate, LegacyInvoice, Payment, PaymentProof, SubscriptionParams,
+    Tranche,
 };
 
 // ---------------------------------------------------------------------------
@@ -81,6 +82,11 @@ fn referral_count_key(referrer: &Address) -> (Symbol, Address) {
 /// Per-payer per-invoice nonce key (issue #21).
 fn nonce_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("nonce"), invoice_id, payer.clone())
+}
+
+/// Authorised factory addresses key (issue #145).
+fn factories_key() -> Symbol {
+    symbol_short!("factories")
 }
 
 /// Per-recipient invoice ID index key (issue #40).
@@ -2045,5 +2051,170 @@ impl SplitContract {
             .get(&total_refunded_key())
             .unwrap_or(0i128);
         (total_invoices, total_volume, total_released, total_refunded)
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #143: Batch recipient management
+    // -----------------------------------------------------------------------
+
+    /// Append up to 50 recipients with amounts in a single transaction.
+    ///
+    /// Requires creator auth. Panics with "payments already received" if any
+    /// payment has been made, and "batch too large" if more than 50 recipients
+    /// are provided.
+    pub fn add_recipients_batch(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        new_recipients: Vec<Address>,
+        new_amounts: Vec<i128>,
+    ) {
+        require_not_paused(&env);
+        caller.require_auth();
+
+        assert!(new_recipients.len() <= 50, "batch too large");
+        assert!(
+            new_recipients.len() == new_amounts.len(),
+            "recipients and amounts length mismatch"
+        );
+
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        assert!(
+            invoice.status == InvoiceStatus::Pending,
+            "invoice is not pending"
+        );
+        assert!(invoice.creator == caller, "only creator can add recipients");
+        assert!(invoice.funded == 0, "payments already received");
+
+        let token = invoice.tokens.get(0).expect("no token");
+
+        for i in 0..new_recipients.len() {
+            let recipient = new_recipients.get(i).unwrap();
+            let amount = new_amounts.get(i).unwrap();
+            assert!(amount > 0, "amounts must be positive");
+
+            invoice.recipients.push_back(recipient.clone());
+            invoice.amounts.push_back(amount);
+            invoice.base_amounts.push_back(amount);
+            invoice.tokens.push_back(token.clone());
+            invoice.claimed.push_back(0i128);
+
+            // Index recipient -> invoice ID (issue #40).
+            let key = recipient_invoice_ids_key(&recipient);
+            let mut ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(&env));
+            ids.push_back(invoice_id);
+            env.storage().persistent().set(&key, &ids);
+        }
+
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("add_batch"), &caller);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #144: Invoice payment analytics oracle
+    // -----------------------------------------------------------------------
+
+    /// Return payment analytics for an invoice.
+    ///
+    /// No auth required. `completion_bps` is funded * 10_000 / total.
+    pub fn get_invoice_stats(env: Env, invoice_id: u64) -> InvoiceStats {
+        let invoice = load_invoice(&env, invoice_id);
+        let total: i128 = invoice.amounts.iter().sum();
+        let payment_count = invoice.payments.len();
+
+        let mut unique: Vec<Address> = Vec::new(&env);
+        for payment in invoice.payments.iter() {
+            if !unique.iter().any(|p| p == payment.payer) {
+                unique.push_back(payment.payer.clone());
+            }
+        }
+
+        let completion_bps = if total > 0 {
+            (invoice.funded as u128 * 10_000u128 / total as u128) as u32
+        } else {
+            0
+        };
+
+        InvoiceStats {
+            funded: invoice.funded,
+            total,
+            payment_count,
+            unique_payers: unique.len(),
+            completion_bps,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #145: Cross-contract composability
+    // -----------------------------------------------------------------------
+
+    /// Authorise an external factory contract to call `create_invoice_for`.
+    ///
+    /// Requires admin auth.
+    pub fn authorise_factory(env: Env, address: Address) {
+        require_admin(&env);
+        let mut factories: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&factories_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        if !factories.iter().any(|f| f == address) {
+            factories.push_back(address);
+        }
+        env.storage().persistent().set(&factories_key(), &factories);
+    }
+
+    /// Create an invoice on behalf of `creator` from an authorised factory contract.
+    ///
+    /// Requires caller auth. Panics with "not authorised factory" if the caller
+    /// is not in the authorised factories list.
+    pub fn create_invoice_for(
+        env: Env,
+        caller: Address,
+        creator: Address,
+        recipients: Vec<Address>,
+        amounts: Vec<i128>,
+        token: Address,
+        deadline: u64,
+    ) -> u64 {
+        require_not_paused(&env);
+        caller.require_auth();
+
+        let factories: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&factories_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        assert!(
+            factories.iter().any(|f| f == caller),
+            "not authorised factory"
+        );
+
+        Self::_create_invoice_inner(
+            &env,
+            creator,
+            recipients,
+            amounts,
+            token,
+            deadline,
+            Vec::new(&env),
+            false,
+            0,
+            0,
+            None,
+            Vec::new(&env),
+            Vec::new(&env),
+            0,
+            0,
+            0,
+            0,
+            Vec::new(&env),
+            None,
+        )
     }
 }

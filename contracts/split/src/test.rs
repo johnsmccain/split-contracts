@@ -3123,3 +3123,176 @@ fn test_analytics_multiple_operations() {
     assert_eq!(tr, 400);
     assert_eq!(tref, 50);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #143: add_recipients_batch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_add_recipients_batch_and_pay() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient0 = Address::generate(&env);
+    let payer = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient0, 100, &token_id, 9_999);
+
+    // Add 5 recipients in batch.
+    let mut new_recipients = Vec::new(&env);
+    let mut new_amounts = Vec::new(&env);
+    for _ in 0..5 {
+        new_recipients.push_back(Address::generate(&env));
+        new_amounts.push_back(50_i128);
+    }
+    c.add_recipients_batch(&creator, &id, &new_recipients, &new_amounts);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.recipients.len(), 6); // 1 original + 5 batch
+    assert_eq!(invoice.amounts.iter().sum::<i128>(), 350); // 100 + 5*50
+
+    // Pay the full new total and verify release.
+    let tk = token_client(&env, &token_id);
+    c.pay(&payer, &id, &350_i128, &0_u64, &false);
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient0), 100);
+    for i in 0..5u32 {
+        assert_eq!(tk.balance(&new_recipients.get(i).unwrap()), 50);
+    }
+}
+
+#[test]
+#[should_panic(expected = "payments already received")]
+fn test_add_recipients_batch_after_payment_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.pay(&payer, &id, &50_i128, &0_u64, &false);
+
+    let mut new_recipients = Vec::new(&env);
+    let mut new_amounts = Vec::new(&env);
+    new_recipients.push_back(Address::generate(&env));
+    new_amounts.push_back(50_i128);
+    c.add_recipients_batch(&creator, &id, &new_recipients, &new_amounts);
+}
+
+#[test]
+#[should_panic(expected = "batch too large")]
+fn test_add_recipients_batch_too_large_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let mut new_recipients = Vec::new(&env);
+    let mut new_amounts = Vec::new(&env);
+    for _ in 0..51 {
+        new_recipients.push_back(Address::generate(&env));
+        new_amounts.push_back(10_i128);
+    }
+    c.add_recipients_batch(&creator, &id, &new_recipients, &new_amounts);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #144: get_invoice_stats
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_get_invoice_stats() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer1, &1_000);
+    StellarAssetClient::new(&env, &token_id).mint(&payer2, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    // Two payers, payer1 pays twice (different nonces), payer2 pays once.
+    c.pay(&payer1, &id, &50_i128, &0_u64, &false);
+    c.pay(&payer2, &id, &50_i128, &0_u64, &false);
+    c.pay(&payer1, &id, &50_i128, &1_u64, &false);
+
+    let stats = c.get_invoice_stats(&id);
+    assert_eq!(stats.funded, 150);
+    assert_eq!(stats.total, 200);
+    assert_eq!(stats.payment_count, 3);
+    assert_eq!(stats.unique_payers, 2);
+    assert_eq!(stats.completion_bps, 7_500); // 150 * 10000 / 200
+}
+
+// ---------------------------------------------------------------------------
+// Issue #145: authorise_factory / create_invoice_for
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_create_invoice_for_authorised_factory() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let factory = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32);
+
+    c.authorise_factory(&factory);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+
+    let id = c.create_invoice_for(&factory, &creator, &recipients, &amounts, &token_id, &9_999_u64);
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.creator, creator);
+    assert_eq!(invoice.status, InvoiceStatus::Pending);
+}
+
+#[test]
+#[should_panic(expected = "not authorised factory")]
+fn test_create_invoice_for_unauthorised_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let not_a_factory = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient);
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+
+    c.create_invoice_for(&not_a_factory, &creator, &recipients, &amounts, &token_id, &9_999_u64);
+}
