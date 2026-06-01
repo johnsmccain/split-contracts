@@ -118,6 +118,8 @@ pub struct InvoiceOptions {
     pub release_stages: Vec<u32>,
     /// Issue #142: optional price oracle contract for dynamic pricing.
     pub price_oracle: Option<Address>,
+    /// Issue #41: optional preferred output token per recipient for DEX swap on release.
+    pub swap_tokens: Vec<Option<Address>>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -208,6 +210,9 @@ pub struct Invoice {
     pub price_oracle: Option<Address>,
     /// Issue #142: base amounts recorded at creation; used to compute oracle-adjusted totals.
     pub base_amounts: Vec<i128>,
+    /// Issue #41: optional preferred output token per recipient for DEX swap on release.
+    /// Parallel to `recipients`; None means pay in the invoice token as normal.
+    pub swap_tokens: Vec<Option<Address>>,
 }
 
 impl Invoice {
@@ -249,6 +254,7 @@ impl Invoice {
             released_stages: 0,
             allowed_payers: None,
             price_oracle: None,
+            swap_tokens: Vec::new(env),
         }
     }
 }
