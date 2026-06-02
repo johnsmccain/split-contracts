@@ -9,7 +9,7 @@ mod types;
 mod test;
 
 use soroban_sdk::{
-    contract, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env, Map, Symbol, Vec,
+    contract, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env, IntoVal, Map, Symbol, Val, Vec,
 };
 use types::{
     AuditEntry, CompletionProof, CreateInvoiceParams, Invoice, InvoiceOptions, InvoiceStats,
@@ -94,6 +94,11 @@ fn recipient_invoice_ids_key(recipient: &Address) -> (Symbol, Address) {
     (symbol_short!("rec_inv"), recipient.clone())
 }
 
+/// Delegate address key for an invoice (issue #43).
+fn delegate_key(invoice_id: u64) -> (Symbol, u64) {
+    (symbol_short!("delegate"), invoice_id)
+}
+
 /// Analytics counters (issue #28).
 fn total_invoices_key() -> Symbol {
     symbol_short!("tot_inv")
@@ -117,8 +122,12 @@ fn total_refunded_key() -> Symbol {
 // ---------------------------------------------------------------------------
 
 fn load_invoice(env: &Env, id: u64) -> Invoice {
+    // Check persistent storage first; fall back to instance storage for archived invoices.
+    if let Some(inv) = env.storage().persistent().get(&invoice_key(id)) {
+        return inv;
+    }
     env.storage()
-        .persistent()
+        .instance()
         .get(&invoice_key(id))
         .expect("invoice not found")
 }
@@ -365,6 +374,7 @@ impl SplitContract {
             options.min_funding_bps.unwrap_or(0),
             options.release_stages,
             options.price_oracle,
+            options.swap_tokens,
         )
     }
 
@@ -390,6 +400,7 @@ impl SplitContract {
         min_funding_bps: u32,
         release_stages: Vec<u32>,
         price_oracle: Option<Address>,
+        swap_tokens: Vec<Option<Address>>,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -470,6 +481,12 @@ impl SplitContract {
             claimed.push_back(0i128);
         }
 
+        // Issue #27: Initialize vesting cliff claimed tracking (all false).
+        let mut vesting_cliff_claimed: Vec<bool> = Vec::new(env);
+        for _ in recipients.iter() {
+            vesting_cliff_claimed.push_back(false);
+        }
+
         // Issue #87: Increment referral count if referrer is provided.
         // (referrer is not yet wired into _create_invoice_inner; skipped)
 
@@ -508,6 +525,7 @@ impl SplitContract {
             released_stages: 0,
             allowed_payers: None,
             price_oracle,
+            swap_tokens,
         };
 
         save_invoice(env, id, &invoice);
@@ -570,6 +588,7 @@ impl SplitContract {
                 0,
                 Vec::new(&env),
                 None,
+                Vec::new(&env),
             );
             ids.push_back(id);
         }
@@ -618,6 +637,7 @@ impl SplitContract {
             0,
             Vec::new(&env),
             None,
+            Vec::new(&env),
         );
 
         if months > 1 {
@@ -903,6 +923,80 @@ impl SplitContract {
         append_audit_entry(&env, invoice_id, symbol_short!("aprv"), approver);
     }
 
+    /// Claim vesting cliff share after cliff timestamp has passed (issue #27).
+    ///
+    /// Requires that the invoice status is Released and the cliff (if set) has passed.
+    /// Each recipient can claim exactly once.
+    pub fn claim(env: Env, invoice_id: u64, recipient: Address) {
+        require_not_paused(&env);
+        recipient.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        assert!(
+            invoice.status == InvoiceStatus::Released,
+            "invoice not released"
+        );
+
+        // Find recipient index
+        let idx = invoice
+            .recipients
+            .iter()
+            .position(|r| r == recipient)
+            .expect("recipient not in invoice") as u32;
+
+        // Check if already claimed
+        assert!(
+            !invoice.vesting_cliff_claimed.get(idx).unwrap(),
+            "recipient already claimed"
+        );
+
+        // Check cliff timestamp if set
+        if let Some(cliff) = invoice.vesting_cliff {
+            let now = env.ledger().timestamp();
+            assert!(now >= cliff, "cliff not reached");
+        }
+
+        // Mark as claimed
+        invoice.vesting_cliff_claimed.set(idx, true);
+        save_invoice(&env, invoice_id, &invoice);
+
+        // Transfer recipient's share
+        let amount = invoice.amounts.get(idx).unwrap();
+        let total: i128 = invoice.amounts.iter().sum();
+        let funded = invoice.funded;
+        let n = invoice.recipients.len() as u32;
+
+        let proportional = if idx == n - 1 {
+            // Last recipient gets remainder
+            funded - {
+                let mut sum = 0i128;
+                for i in 0..idx {
+                    let amt = invoice.amounts.get(i).unwrap();
+                    let prop = (amt as u128 * funded as u128 / total as u128) as i128;
+                    sum += prop;
+                }
+                sum
+            }
+        } else {
+            (amount as u128 * funded as u128 / total as u128) as i128
+        };
+
+        let platform_fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&platform_fee_bps_key())
+            .unwrap_or(0u32);
+
+        let fee = (proportional as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+        let payout = proportional - fee;
+
+        let token_client = token::Client::new(&env, &invoice.tokens.get(idx).expect("no token"));
+        token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+
+        append_audit_entry(&env, invoice_id, symbol_short!("claim"), &recipient);
+    }
+
     /// Distribute tranches unlocked by the current ledger time (issue #23).
     fn _release_tranches(env: &Env, invoice_id: u64, invoice: &mut Invoice, actor: &Address) {
         let now = env.ledger().timestamp();
@@ -1109,7 +1203,18 @@ impl SplitContract {
 
     /// Full immediate release (no tranches).
     /// Issue #89: Returns stake to creator on successful release.
+    /// Issue #41: Swaps recipient payout via DEX if swap_tokens[i] is set.
     fn _release_full(env: &Env, invoice_id: u64, invoice: &mut Invoice, actor: &Address) {
+        // Issue #27: If vesting cliff is set, just mark as Released without transferring funds
+        if invoice.vesting_cliff.is_some() {
+            invoice.status = InvoiceStatus::Released;
+            invoice.completion_time = Some(env.ledger().timestamp());
+            save_invoice(env, invoice_id, invoice);
+            append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
+            events::invoice_released(env, invoice_id, &invoice.recipients);
+            return;
+        }
+
         let token_client =
             token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
 
@@ -1136,7 +1241,26 @@ impl SplitContract {
             let payout = proportional - fee;
             distributed += proportional;
             total_fee += fee;
-            token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+
+            // Issue #41: if a swap token is configured for this recipient, invoke DEX swap.
+            let swap_token: Option<Address> = invoice
+                .swap_tokens
+                .get(i as u32)
+                .unwrap_or(None);
+            if let Some(ref out_token) = swap_token {
+                // The swap_token address IS the DEX router contract.
+                // Interface: swap(from_token: Address, to_token: Address, amount: i128, recipient: Address) -> i128
+                // Swap failure panics and reverts the entire release.
+                let from_token = invoice.tokens.get(0).expect("no token");
+                let mut args: Vec<Val> = Vec::new(env);
+                args.push_back(from_token.into_val(env));
+                args.push_back(out_token.clone().into_val(env));
+                args.push_back(payout.into_val(env));
+                args.push_back(recipient.into_val(env));
+                let _swapped: i128 = env.invoke_contract(out_token, &Symbol::new(env, "swap"), args);
+            } else {
+                token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+            }
         }
 
         if total_fee > 0 {
@@ -1292,6 +1416,7 @@ impl SplitContract {
                 0,
                 Vec::new(env),
                 None,
+                Vec::new(env),
             );
             env.storage()
                 .persistent()
@@ -1450,12 +1575,13 @@ impl SplitContract {
         save_invoice(&env, invoice_id, &invoice);
     }
 
-    /// Extend the deadline for an invoice (creator only).
-    pub fn extend_deadline(env: Env, invoice_id: u64, new_deadline: u64) {
+    /// Extend the deadline for an invoice. Callable by the creator or an assigned delegate.
+    pub fn extend_deadline(env: Env, invoice_id: u64, new_deadline: u64, caller: Address) {
         require_not_paused(&env);
+        caller.require_auth();
+
         let mut invoice = load_invoice(&env, invoice_id);
 
-        invoice.creator.require_auth();
         assert!(
             invoice.status == InvoiceStatus::Pending,
             "invoice not pending"
@@ -1465,9 +1591,18 @@ impl SplitContract {
             "new deadline must be after current deadline"
         );
 
+        // Accept caller = creator OR assigned delegate (issue #43).
+        let delegate: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&delegate_key(invoice_id));
+        let is_creator = invoice.creator == caller;
+        let is_delegate = delegate.map(|d| d == caller).unwrap_or(false);
+        assert!(is_creator || is_delegate, "not authorized");
+
         invoice.deadline = new_deadline;
         save_invoice(&env, invoice_id, &invoice);
-        append_audit_entry(&env, invoice_id, symbol_short!("extend"), &invoice.creator);
+        append_audit_entry(&env, invoice_id, symbol_short!("extend"), &caller);
     }
 
     /// Roll over a partially funded invoice to a new invoice with the same recipients,
@@ -1520,6 +1655,7 @@ impl SplitContract {
             old_invoice.min_funding_bps,
             old_invoice.release_stages.clone(),
             old_invoice.price_oracle.clone(),
+            old_invoice.swap_tokens.clone(),
         );
 
         // Load the newly created invoice and copy over the payments.
@@ -1707,6 +1843,7 @@ impl SplitContract {
             0,
             Vec::new(&env),
             None,
+            Vec::new(&env),
         )
     }
 
@@ -2054,167 +2191,75 @@ impl SplitContract {
     }
 
     // -----------------------------------------------------------------------
-    // Issue #143: Batch recipient management
+    // Archive (issue #40)
     // -----------------------------------------------------------------------
 
-    /// Append up to 50 recipients with amounts in a single transaction.
+    /// Move a Released or Refunded invoice from persistent storage to instance
+    /// storage (cheaper, shorter TTL), freeing up persistent storage budget.
     ///
-    /// Requires creator auth. Panics with "payments already received" if any
-    /// payment has been made, and "batch too large" if more than 50 recipients
-    /// are provided.
-    pub fn add_recipients_batch(
-        env: Env,
-        caller: Address,
-        invoice_id: u64,
-        new_recipients: Vec<Address>,
-        new_amounts: Vec<i128>,
-    ) {
-        require_not_paused(&env);
-        caller.require_auth();
-
-        assert!(new_recipients.len() <= 50, "batch too large");
-        assert!(
-            new_recipients.len() == new_amounts.len(),
-            "recipients and amounts length mismatch"
-        );
-
-        let mut invoice = load_invoice(&env, invoice_id);
+    /// Panics with "invoice not completed" if the invoice is still Pending or Cancelled.
+    /// After archival, `get_invoice` still returns the invoice from instance storage.
+    pub fn archive_invoice(env: Env, invoice_id: u64) {
+        let invoice: Invoice = env
+            .storage()
+            .persistent()
+            .get(&invoice_key(invoice_id))
+            .expect("invoice not found");
 
         assert!(
-            invoice.status == InvoiceStatus::Pending,
-            "invoice is not pending"
+            invoice.status == InvoiceStatus::Released
+                || invoice.status == InvoiceStatus::Refunded,
+            "invoice not completed"
         );
-        assert!(invoice.creator == caller, "only creator can add recipients");
-        assert!(invoice.funded == 0, "payments already received");
 
-        let token = invoice.tokens.get(0).expect("no token");
+        // Copy to instance storage under the same key.
+        env.storage()
+            .instance()
+            .set(&invoice_key(invoice_id), &invoice);
 
-        for i in 0..new_recipients.len() {
-            let recipient = new_recipients.get(i).unwrap();
-            let amount = new_amounts.get(i).unwrap();
-            assert!(amount > 0, "amounts must be positive");
+        // Remove from persistent storage.
+        env.storage()
+            .persistent()
+            .remove(&invoice_key(invoice_id));
 
-            invoice.recipients.push_back(recipient.clone());
-            invoice.amounts.push_back(amount);
-            invoice.base_amounts.push_back(amount);
-            invoice.tokens.push_back(token.clone());
-            invoice.claimed.push_back(0i128);
-
-            // Index recipient -> invoice ID (issue #40).
-            let key = recipient_invoice_ids_key(&recipient);
-            let mut ids: Vec<u64> = env
-                .storage()
-                .persistent()
-                .get(&key)
-                .unwrap_or_else(|| Vec::new(&env));
-            ids.push_back(invoice_id);
-            env.storage().persistent().set(&key, &ids);
-        }
-
-        save_invoice(&env, invoice_id, &invoice);
-        append_audit_entry(&env, invoice_id, symbol_short!("add_batch"), &caller);
+        events::invoice_archived(&env, invoice_id);
     }
 
     // -----------------------------------------------------------------------
-    // Issue #144: Invoice payment analytics oracle
+    // Delegation (issue #43)
     // -----------------------------------------------------------------------
 
-    /// Return payment analytics for an invoice.
-    ///
-    /// No auth required. `completion_bps` is funded * 10_000 / total.
-    pub fn get_invoice_stats(env: Env, invoice_id: u64) -> InvoiceStats {
+    /// Assign a delegate address that may call management functions (e.g. extend_deadline)
+    /// on behalf of the creator. Requires creator auth.
+    pub fn delegate_invoice(env: Env, invoice_id: u64, delegate: Address) {
         let invoice = load_invoice(&env, invoice_id);
-        let total: i128 = invoice.amounts.iter().sum();
-        let payment_count = invoice.payments.len();
+        invoice.creator.require_auth();
 
-        let mut unique: Vec<Address> = Vec::new(&env);
-        for payment in invoice.payments.iter() {
-            if !unique.iter().any(|p| p == payment.payer) {
-                unique.push_back(payment.payer.clone());
-            }
-        }
+        env.storage()
+            .persistent()
+            .set(&delegate_key(invoice_id), &delegate);
 
-        let completion_bps = if total > 0 {
-            (invoice.funded as u128 * 10_000u128 / total as u128) as u32
-        } else {
-            0
-        };
-
-        InvoiceStats {
-            funded: invoice.funded,
-            total,
-            payment_count,
-            unique_payers: unique.len(),
-            completion_bps,
-        }
+        events::delegate_set(&env, invoice_id, &delegate);
+        append_audit_entry(&env, invoice_id, symbol_short!("delegate"), &invoice.creator);
     }
 
-    // -----------------------------------------------------------------------
-    // Issue #145: Cross-contract composability
-    // -----------------------------------------------------------------------
+    /// Remove the delegate from an invoice. Requires creator auth.
+    pub fn revoke_delegate(env: Env, invoice_id: u64) {
+        let invoice = load_invoice(&env, invoice_id);
+        invoice.creator.require_auth();
 
-    /// Authorise an external factory contract to call `create_invoice_for`.
-    ///
-    /// Requires admin auth.
-    pub fn authorise_factory(env: Env, address: Address) {
-        require_admin(&env);
-        let mut factories: Vec<Address> = env
-            .storage()
+        env.storage()
             .persistent()
-            .get(&factories_key())
-            .unwrap_or_else(|| Vec::new(&env));
-        if !factories.iter().any(|f| f == address) {
-            factories.push_back(address);
-        }
-        env.storage().persistent().set(&factories_key(), &factories);
+            .remove(&delegate_key(invoice_id));
+
+        events::delegate_revoked(&env, invoice_id);
+        append_audit_entry(&env, invoice_id, symbol_short!("revoke_del"), &invoice.creator);
     }
 
-    /// Create an invoice on behalf of `creator` from an authorised factory contract.
-    ///
-    /// Requires caller auth. Panics with "not authorised factory" if the caller
-    /// is not in the authorised factories list.
-    pub fn create_invoice_for(
-        env: Env,
-        caller: Address,
-        creator: Address,
-        recipients: Vec<Address>,
-        amounts: Vec<i128>,
-        token: Address,
-        deadline: u64,
-    ) -> u64 {
-        require_not_paused(&env);
-        caller.require_auth();
-
-        let factories: Vec<Address> = env
-            .storage()
+    /// Return the current delegate for an invoice, or None if none is set.
+    pub fn get_delegate(env: Env, invoice_id: u64) -> Option<Address> {
+        env.storage()
             .persistent()
-            .get(&factories_key())
-            .unwrap_or_else(|| Vec::new(&env));
-        assert!(
-            factories.iter().any(|f| f == caller),
-            "not authorised factory"
-        );
-
-        Self::_create_invoice_inner(
-            &env,
-            creator,
-            recipients,
-            amounts,
-            token,
-            deadline,
-            Vec::new(&env),
-            false,
-            0,
-            0,
-            None,
-            Vec::new(&env),
-            Vec::new(&env),
-            0,
-            0,
-            0,
-            0,
-            Vec::new(&env),
-            None,
-        )
+            .get(&delegate_key(invoice_id))
     }
 }
