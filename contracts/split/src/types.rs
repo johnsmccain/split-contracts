@@ -1,5 +1,13 @@
 use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol, Vec, String};
 
+/// Issue #: A single (invoice_id, amount) pair for pool_pay.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InvoicePayment {
+    pub invoice_id: u64,
+    pub amount: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum InvoiceStatus {
@@ -124,6 +132,10 @@ pub struct InvoiceOptions {
     pub tax_authority: Option<Address>,
     pub insurance_premium_bps: Option<u32>,
     pub smart_route: Option<bool>,
+    /// Issue #1: when true, _release() registers funds with the stream contract instead of direct transfer.
+    pub convert_to_stream: bool,
+    /// Issue #2: tokens accepted in pay_with_token(); base token is always accepted implicitly.
+    pub accepted_tokens: Vec<Address>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -227,6 +239,10 @@ pub struct Invoice {
     pub insurance_premium_bps: u32,
     pub insurance_fund: i128,
     pub smart_route: bool,
+    /// Issue #1: when true, _release() registers funds with the stream contract.
+    pub convert_to_stream: bool,
+    /// Issue #2: additional tokens accepted by pay_with_token().
+    pub accepted_tokens: Vec<Address>,
 }
 
 /// Issue #144: Payment analytics for an invoice, callable by external contracts.
@@ -291,6 +307,8 @@ impl Invoice {
             insurance_premium_bps: 0,
             insurance_fund: 0,
             smart_route: false,
+            convert_to_stream: false,
+            accepted_tokens: Vec::new(env),
         }
     }
 }

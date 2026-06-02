@@ -14,9 +14,9 @@ use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env, IntoVal, Map, Symbol, Val, Vec,
 };
 use types::{
-    AuditEntry, CompletionProof, CreateInvoiceParams, Invoice, InvoiceOptions, InvoiceStats,
-    InvoiceStatus, InvoiceTemplate, LegacyInvoice, Payment, PaymentProof, SubscriptionParams,
-    Tranche,
+    AuditEntry, CompletionProof, CreateInvoiceParams, Invoice, InvoiceOptions, InvoicePayment,
+    InvoiceStats, InvoiceStatus, InvoiceTemplate, LegacyInvoice, Payment, PaymentProof,
+    SubscriptionParams, Tranche,
 };
 
 // ---------------------------------------------------------------------------
@@ -103,6 +103,16 @@ fn factories_key() -> Symbol {
 /// Per-recipient invoice ID index key (issue #40).
 fn recipient_invoice_ids_key(recipient: &Address) -> (Symbol, Address) {
     (symbol_short!("rec_inv"), recipient.clone())
+}
+
+/// Issue #1: Stellar payment streaming contract address.
+fn stream_contract_key() -> Symbol {
+    symbol_short!("strm_ctr")
+}
+
+/// Issue #4: Creator whitelist key.
+fn creator_whitelist_key() -> Symbol {
+    symbol_short!("creator_wl")
 }
 
 /// Delegate address key for an invoice (issue #43).
@@ -285,6 +295,62 @@ impl SplitContract {
         env.storage().instance().set(&treasury_key(), &treasury);
     }
 
+    // -----------------------------------------------------------------------
+    // Issue #1: stream contract admin setter
+    // -----------------------------------------------------------------------
+
+    /// Store the address of the Stellar payment streaming contract. Requires admin auth.
+    pub fn set_stream_contract(env: Env, admin: Address, contract: Address) {
+        require_admin(&env);
+        let _ = admin;
+        env.storage().persistent().set(&stream_contract_key(), &contract);
+    }
+
+    /// Store the DEX contract address used for token swaps in pay_with_token(). Requires admin auth.
+    pub fn set_dex_contract(env: Env, admin: Address, contract: Address) {
+        require_admin(&env);
+        let _ = admin;
+        env.storage().persistent().set(&soroban_sdk::symbol_short!("dex_ctr"), &contract);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #4: creator whitelist
+    // -----------------------------------------------------------------------
+
+    /// Add an address to the creator whitelist. Requires admin auth.
+    /// When the whitelist is non-empty, only listed addresses may call create_invoice().
+    pub fn whitelist_creator(env: Env, admin: Address, address: Address) {
+        require_admin(&env);
+        let _ = admin;
+        let mut wl: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&creator_whitelist_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        if !wl.iter().any(|a| a == address) {
+            wl.push_back(address);
+        }
+        env.storage().persistent().set(&creator_whitelist_key(), &wl);
+    }
+
+    /// Remove an address from the creator whitelist. Requires admin auth.
+    pub fn remove_creator(env: Env, admin: Address, address: Address) {
+        require_admin(&env);
+        let _ = admin;
+        let wl: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&creator_whitelist_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_wl: Vec<Address> = Vec::new(&env);
+        for a in wl.iter() {
+            if a != address {
+                new_wl.push_back(a);
+            }
+        }
+        env.storage().persistent().set(&creator_whitelist_key(), &new_wl);
+    }
+
     /// Return the current creation fee.
     pub fn get_creation_fee(env: Env) -> i128 {
         env.storage()
@@ -377,6 +443,17 @@ impl SplitContract {
     ) -> u64 {
         require_not_paused(&env);
         creator.require_auth();
+
+        // Issue #4: reject creator if whitelist is non-empty and creator is not on it.
+        let wl: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&creator_whitelist_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        if !wl.is_empty() {
+            assert!(wl.iter().any(|a| a == creator), "creator not whitelisted");
+        }
+
         Self::_create_invoice_inner(
             &env,
             creator,
@@ -402,10 +479,11 @@ impl SplitContract {
             options.tax_authority,
             options.insurance_premium_bps.unwrap_or(0),
             options.smart_route.unwrap_or(false),
+            options.convert_to_stream,
+            options.accepted_tokens,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn _create_invoice_inner(
         env: &Env,
@@ -432,6 +510,8 @@ impl SplitContract {
         tax_authority: Option<Address>,
         insurance_premium_bps: u32,
         smart_route: bool,
+        convert_to_stream: bool,
+        accepted_tokens: Vec<Address>,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -599,6 +679,8 @@ impl SplitContract {
             insurance_premium_bps,
             insurance_fund: 0,
             smart_route,
+            convert_to_stream,
+            accepted_tokens,
         };
 
         save_invoice(env, id, &invoice);
@@ -665,6 +747,9 @@ impl SplitContract {
                 0,
                 None,
                 0,
+                false,
+                false,
+                Vec::new(&env),
             );
             ids.push_back(id);
         }
@@ -718,6 +803,8 @@ impl SplitContract {
             None,
             0,
             false,
+            false,
+            Vec::new(&env),
         );
 
         if months > 1 {
@@ -1003,6 +1090,180 @@ impl SplitContract {
             }
         } else {
             save_invoice(env, invoice_id, &invoice);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #2: pay with an alternate accepted token
+    // -----------------------------------------------------------------------
+
+    /// Pay toward an invoice using any token listed in `invoice.accepted_tokens`.
+    ///
+    /// When `source_token` differs from the invoice base token, the contract
+    /// transfers `amount` of `source_token` from `payer` to itself, then calls
+    /// the on-chain DEX (stored at "dex_ctr") to swap it for the invoice token.
+    /// The converted amount is credited to `invoice.funded`.
+    pub fn pay_with_token(
+        env: Env,
+        payer: Address,
+        invoice_id: u64,
+        source_token: Address,
+        amount: i128,
+        nonce: u64,
+    ) {
+        require_not_paused(&env);
+        payer.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
+        assert!(env.ledger().timestamp() <= invoice.deadline, "invoice deadline has passed");
+        assert!(amount > 0, "payment amount must be positive");
+
+        let invoice_token = invoice.tokens.get(0).expect("no token");
+
+        // Accept the base token or any token in accepted_tokens.
+        let is_base = source_token == invoice_token;
+        let is_accepted = is_base
+            || invoice.accepted_tokens.iter().any(|t| t == source_token);
+        assert!(is_accepted, "token not accepted");
+
+        // Validate and increment nonce.
+        let stored_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&nonce_key(invoice_id, &payer))
+            .unwrap_or(0u64);
+        assert!(nonce == stored_nonce, "invalid nonce");
+        env.storage()
+            .persistent()
+            .set(&nonce_key(invoice_id, &payer), &(stored_nonce + 1));
+
+        let credited_amount = if is_base {
+            // Direct transfer of the invoice token.
+            let token_client = token::Client::new(&env, &invoice_token);
+            token_client.transfer(&payer, &env.current_contract_address(), &amount);
+            amount
+        } else {
+            // Transfer source token from payer to contract.
+            let src_client = token::Client::new(&env, &source_token);
+            src_client.transfer(&payer, &env.current_contract_address(), &amount);
+
+            // Swap source_token -> invoice_token via DEX contract.
+            let dex: Address = env
+                .storage()
+                .persistent()
+                .get(&soroban_sdk::symbol_short!("dex_ctr"))
+                .expect("dex contract not set");
+            let mut args: Vec<Val> = Vec::new(&env);
+            args.push_back(source_token.into_val(&env));
+            args.push_back(invoice_token.into_val(&env));
+            args.push_back(amount.into_val(&env));
+            let converted: i128 = env.invoke_contract(&dex, &Symbol::new(&env, "swap"), args);
+            converted
+        };
+
+        let total: i128 = invoice.amounts.iter().sum();
+        let remaining = total - invoice.funded;
+        assert!(credited_amount <= remaining, "payment exceeds remaining balance");
+
+        invoice.payments.push_back(Payment { payer: payer.clone(), amount: credited_amount, tip: 0 });
+        invoice.funded += credited_amount;
+
+        append_audit_entry(&env, invoice_id, symbol_short!("pay_tok"), &payer);
+        events::payment_received(&env, invoice_id, &payer, credited_amount);
+
+        if invoice.funded >= total {
+            let in_group = env.storage().persistent().has(&invoice_group_key(invoice_id));
+            let guarded =
+                invoice.prerequisite_id.is_some()
+                    || !invoice.tranches.is_empty()
+                    || !invoice.release_stages.is_empty()
+                    || in_group
+                    || !invoice.co_signers.is_empty();
+            if guarded {
+                save_invoice(&env, invoice_id, &invoice);
+            } else {
+                Self::_release(&env, invoice_id, &mut invoice, &payer);
+            }
+        } else {
+            save_invoice(&env, invoice_id, &invoice);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #3: batched multi-invoice payment
+    // -----------------------------------------------------------------------
+
+    /// Pay toward multiple invoices in a single call, using only one token transfer.
+    ///
+    /// All invoices must share the same base token. The payer's total is transferred
+    /// once; each invoice's `funded` counter is then updated via internal accounting.
+    /// Any invalid payment (wrong status, over limit) reverts the entire call.
+    /// Invoices that become fully funded trigger auto-release where applicable.
+    pub fn pool_pay(env: Env, payer: Address, payments: Vec<InvoicePayment>) {
+        require_not_paused(&env);
+        payer.require_auth();
+
+        assert!(!payments.is_empty(), "payments must not be empty");
+
+        // Determine the shared token from the first invoice.
+        let first_inv = load_invoice(&env, payments.get(0).unwrap().invoice_id);
+        let shared_token = first_inv.tokens.get(0).expect("no token");
+
+        // Validate all payments and compute total.
+        let mut total: i128 = 0;
+        for p in payments.iter() {
+            let inv = load_invoice(&env, p.invoice_id);
+            assert!(inv.status == InvoiceStatus::Pending, "invoice is not pending");
+            assert!(
+                env.ledger().timestamp() <= inv.deadline,
+                "invoice deadline has passed"
+            );
+            assert!(p.amount > 0, "payment amount must be positive");
+            let inv_total: i128 = inv.amounts.iter().sum();
+            assert!(
+                inv.funded + p.amount <= inv_total,
+                "payment exceeds remaining balance"
+            );
+            // All invoices must use the same token.
+            assert!(
+                inv.tokens.get(0).expect("no token") == shared_token,
+                "all invoices must use the same token"
+            );
+            total += p.amount;
+        }
+
+        // Single token transfer from payer to contract.
+        let token_client = token::Client::new(&env, &shared_token);
+        token_client.transfer(&payer, &env.current_contract_address(), &total);
+
+        // Update each invoice via internal accounting (no further token transfers).
+        for p in payments.iter() {
+            let mut inv = load_invoice(&env, p.invoice_id);
+            inv.payments.push_back(Payment { payer: payer.clone(), amount: p.amount, tip: 0 });
+            inv.funded += p.amount;
+
+            append_audit_entry(&env, p.invoice_id, symbol_short!("pool_pay"), &payer);
+            events::payment_received(&env, p.invoice_id, &payer, p.amount);
+
+            let inv_total: i128 = inv.amounts.iter().sum();
+            if inv.funded >= inv_total {
+                let in_group = env.storage().persistent().has(&invoice_group_key(p.invoice_id));
+                let guarded =
+                    inv.prerequisite_id.is_some()
+                        || !inv.tranches.is_empty()
+                        || !inv.release_stages.is_empty()
+                        || in_group
+                        || !inv.co_signers.is_empty();
+                if guarded {
+                    save_invoice(&env, p.invoice_id, &inv);
+                } else {
+                    Self::_release(&env, p.invoice_id, &mut inv, &payer);
+                }
+            } else {
+                save_invoice(&env, p.invoice_id, &inv);
+            }
         }
     }
 
@@ -1527,9 +1788,6 @@ impl SplitContract {
                 .get(i as u32)
                 .unwrap_or(None);
             if let Some(ref out_token) = swap_token {
-                // The swap_token address IS the DEX router contract.
-                // Interface: swap(from_token: Address, to_token: Address, amount: i128, recipient: Address) -> i128
-                // Swap failure panics and reverts the entire release.
                 let from_token = invoice.tokens.get(0).expect("no token");
                 let mut args: Vec<Val> = Vec::new(env);
                 args.push_back(from_token.into_val(env));
@@ -1743,6 +2001,9 @@ impl SplitContract {
                 0,
                 None,
                 0,
+                false,
+                false,
+                Vec::new(env),
             );
             env.storage()
                 .persistent()
@@ -2007,6 +2268,12 @@ impl SplitContract {
             old_invoice.release_stages.clone(),
             old_invoice.price_oracle.clone(),
             old_invoice.swap_tokens.clone(),
+            old_invoice.tax_bps,
+            old_invoice.tax_authority.clone(),
+            old_invoice.insurance_premium_bps,
+            old_invoice.smart_route,
+            old_invoice.convert_to_stream,
+            old_invoice.accepted_tokens.clone(),
         );
 
         // Load the newly created invoice and copy over the payments.
@@ -2194,6 +2461,12 @@ impl SplitContract {
             0,
             Vec::new(&env),
             None,
+            Vec::new(&env),
+            0,
+            None,
+            0,
+            false,
+            false,
             Vec::new(&env),
         )
     }

@@ -37,23 +37,28 @@ fn token_client<'a>(env: &'a Env, token_id: &Address) -> TokenClient<'a> {
 
 fn default_options(env: &Env) -> InvoiceOptions {
     InvoiceOptions {
-            co_creators: Vec::new(env),
-            allow_early_withdrawal: false,
-            bonus_pool: 0,
-            bonus_max_payers: 0,
-            prerequisite_id: None,
-            tranches: Vec::new(env),
-            co_signers: Vec::new(env),
-            required_signatures: 0,
-            penalty_bps: None,
-            penalty_deadline: None,
-            min_funding_bps: None,
-            release_stages: Vec::new(env),
-            price_oracle: None,
-            swap_tokens: Vec::new(env),
-            cross_chain_ref: None,
-        }
+        co_creators: Vec::new(env),
+        allow_early_withdrawal: false,
+        bonus_pool: 0,
+        bonus_max_payers: 0,
+        prerequisite_id: None,
+        tranches: Vec::new(env),
+        co_signers: Vec::new(env),
+        required_signatures: 0,
+        penalty_bps: None,
+        penalty_deadline: None,
+        min_funding_bps: None,
+        release_stages: Vec::new(env),
+        price_oracle: None,
+        swap_tokens: Vec::new(env),
+        tax_bps: None,
+        tax_authority: None,
+        insurance_premium_bps: None,
+        smart_route: None,
+        convert_to_stream: false,
+        accepted_tokens: Vec::new(env),
     }
+}
 
 /// Create a basic single-recipient invoice with default optional params.
 fn make_invoice(
@@ -3446,4 +3451,319 @@ fn test_payment_channel_insufficient() {
 
     c.open_channel(&payer, &id, &100_i128);
     c.channel_pay(&payer, &id, &150_i128); // Panics
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1: convert_to_stream
+// ---------------------------------------------------------------------------
+
+/// Mock stream contract: records that create_stream was called via persistent storage.
+#[contract]
+struct MockStream;
+
+#[contractimpl]
+impl MockStream {
+    pub fn create_stream(env: Env, recipient: Address, amount: i128, duration: u64) {
+        // Store the last call args so tests can verify.
+        env.storage().persistent().set(&soroban_sdk::symbol_short!("s_rec"), &recipient);
+        env.storage().persistent().set(&soroban_sdk::symbol_short!("s_amt"), &amount);
+        env.storage().persistent().set(&soroban_sdk::symbol_short!("s_dur"), &duration);
+    }
+}
+
+#[test]
+fn test_convert_to_stream_calls_stream_contract() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None);
+
+    let stream_id = env.register(MockStream, ());
+    c.set_stream_contract(&admin, &stream_id);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let mut opts = default_options(&env);
+    opts.convert_to_stream = true;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(200_i128);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999, &opts);
+
+    // Trigger release by fully paying the invoice.
+    c.pay(&payer, &id, &200_i128, &0, &false);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.status, InvoiceStatus::Released);
+
+    // Verify stream contract was called: tokens transferred to stream contract.
+    let tk = token_client(&env, &token_id);
+    assert_eq!(tk.balance(&stream_id), 200);
+}
+
+#[test]
+fn test_convert_to_stream_false_uses_direct_transfer() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &300);
+    env.ledger().set_timestamp(1_000);
+
+    // convert_to_stream defaults to false
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id, &200_i128, &0, &false);
+
+    let tk = token_client(&env, &token_id);
+    // Direct transfer: recipient gets the tokens, not the stream contract.
+    assert_eq!(tk.balance(&recipient), 200);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #2: pay_with_token
+// ---------------------------------------------------------------------------
+
+/// Mock DEX: returns the input amount as the swapped output (1:1 rate).
+#[contract]
+struct MockDex;
+
+#[contractimpl]
+impl MockDex {
+    pub fn swap(_env: Env, _source: Address, _dest: Address, amount: i128) -> i128 {
+        amount
+    }
+}
+
+#[test]
+fn test_pay_with_token_accepted_token_credited() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None);
+
+    // Register alternate token and DEX.
+    let alt_token_admin = Address::generate(&env);
+    let alt_token_id = env
+        .register_stellar_asset_contract_v2(alt_token_admin.clone())
+        .address();
+    StellarAssetClient::new(&env, &alt_token_id).mint(&payer, &1_000);
+
+    let dex_id = env.register(MockDex, ());
+    c.set_dex_contract(&admin, &dex_id);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut accepted = Vec::new(&env);
+    accepted.push_back(alt_token_id.clone());
+
+    let mut opts = default_options(&env);
+    opts.accepted_tokens = accepted;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(300_i128);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999, &opts);
+
+    // Pay with the alternate token — DEX converts 1:1 so 300 gets credited.
+    c.pay_with_token(&payer, &id, &alt_token_id, &300_i128, &0);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.funded, 300);
+}
+
+#[test]
+#[should_panic(expected = "token not accepted")]
+fn test_pay_with_token_non_listed_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let unknown_admin = Address::generate(&env);
+    let unknown_token = env
+        .register_stellar_asset_contract_v2(unknown_admin.clone())
+        .address();
+    StellarAssetClient::new(&env, &unknown_token).mint(&payer, &500);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with empty accepted_tokens (only base token accepted).
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    // Attempting to pay with an unlisted token must panic.
+    c.pay_with_token(&payer, &id, &unknown_token, &200_i128, &0);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #3: pool_pay
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_pool_pay_three_invoices_funded_correctly() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &r1, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &r2, 200, &token_id, 9_999);
+    let id3 = make_invoice(&env, &c, &creator, &r3, 300, &token_id, 9_999);
+
+    let mut payments = Vec::new(&env);
+    payments.push_back(types::InvoicePayment { invoice_id: id1, amount: 100 });
+    payments.push_back(types::InvoicePayment { invoice_id: id2, amount: 200 });
+    payments.push_back(types::InvoicePayment { invoice_id: id3, amount: 300 });
+
+    // Payer balance before: 1000; total payment: 600 → balance after: 400.
+    c.pool_pay(&payer, &payments);
+
+    assert_eq!(tk.balance(&payer), 400);
+
+    // All three invoices fully funded and auto-released.
+    assert_eq!(c.get_invoice(&id1).funded, 100);
+    assert_eq!(c.get_invoice(&id2).funded, 200);
+    assert_eq!(c.get_invoice(&id3).funded, 300);
+    assert_eq!(c.get_invoice(&id1).status, InvoiceStatus::Released);
+    assert_eq!(c.get_invoice(&id2).status, InvoiceStatus::Released);
+    assert_eq!(c.get_invoice(&id3).status, InvoiceStatus::Released);
+}
+
+#[test]
+#[should_panic(expected = "invoice is not pending")]
+fn test_pool_pay_invalid_invoice_reverts_all() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    // Pay id1 so it releases, making it no longer Pending.
+    c.pay(&payer, &id1, &100_i128, &0, &false);
+
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let mut payments = Vec::new(&env);
+    payments.push_back(types::InvoicePayment { invoice_id: id1, amount: 50 }); // id1 no longer Pending
+    payments.push_back(types::InvoicePayment { invoice_id: id2, amount: 50 });
+
+    c.pool_pay(&payer, &payments); // should panic
+}
+
+// ---------------------------------------------------------------------------
+// Issue #4: creator whitelist
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_whitelist_empty_allows_any_creator() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None);
+    env.ledger().set_timestamp(1_000);
+
+    // No whitelist set — any creator may create.
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    assert_eq!(id, 1);
+}
+
+#[test]
+#[should_panic(expected = "creator not whitelisted")]
+fn test_non_whitelisted_creator_rejected() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let whitelisted = Address::generate(&env);
+    let not_whitelisted = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None);
+    c.whitelist_creator(&admin, &whitelisted);
+
+    env.ledger().set_timestamp(1_000);
+
+    // not_whitelisted is not on the list — must panic.
+    make_invoice(&env, &c, &not_whitelisted, &recipient, 100, &token_id, 9_999);
+}
+
+#[test]
+fn test_whitelisted_creator_can_create() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None);
+    c.whitelist_creator(&admin, &creator);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    assert_eq!(id, 1);
+}
+
+#[test]
+fn test_remove_creator_from_whitelist() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None);
+    c.whitelist_creator(&admin, &creator);
+    c.remove_creator(&admin, &creator);
+
+    env.ledger().set_timestamp(1_000);
+
+    // After removal the whitelist is empty again, so any creator is allowed.
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    assert_eq!(id, 1);
 }
