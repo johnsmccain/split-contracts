@@ -95,6 +95,11 @@ fn nonce_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("nonce"), invoice_id, payer.clone())
 }
 
+/// Per-payer velocity window state key: (window_start, window_total)
+fn vel_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("vel"), invoice_id, payer.clone())
+}
+
 /// Authorised factory addresses key (issue #145).
 fn factories_key() -> Symbol {
     symbol_short!("factories")
@@ -531,6 +536,11 @@ impl SplitContract {
             options.smart_route.unwrap_or(false),
             options.convert_to_stream,
             options.accepted_tokens,
+            options.forward_to,
+            options.forward_invoice_id,
+            options.creator_cosigner,
+            options.velocity_limit,
+            options.velocity_window,
             options.split_rules,
             options.auto_resolve_rules,
         )
@@ -564,6 +574,11 @@ impl SplitContract {
         smart_route: bool,
         convert_to_stream: bool,
         accepted_tokens: Vec<Address>,
+        forward_to: Option<Address>,
+        forward_invoice_id: Option<u64>,
+        creator_cosigner: Option<Address>,
+        velocity_limit: i128,
+        velocity_window: u64,
         split_rules: Vec<SplitRule>,
         auto_resolve_rules: Vec<ResolveRule>,
     ) -> u64 {
@@ -770,8 +785,13 @@ impl SplitContract {
             smart_route,
             convert_to_stream,
             accepted_tokens,
+            forward_to,
+            forward_invoice_id,
             split_rules,
             auto_resolve_rules,
+            creator_cosigner,
+            velocity_limit,
+            velocity_window,
         };
 
         save_invoice(env, id, &invoice);
@@ -848,9 +868,10 @@ impl SplitContract {
                 Vec::new(&env),
                 0,
                 None,
+                None,
+                None,
                 0,
-                false,
-                false,
+                0,
                 Vec::new(&env),
                 Vec::new(&env),
                 Vec::new(&env),
@@ -905,9 +926,10 @@ impl SplitContract {
             Vec::new(&env),
             0,
             None,
+            None,
+            None,
             0,
-            false,
-            false,
+            0,
             Vec::new(&env),
             Vec::new(&env),
             Vec::new(&env),
@@ -1106,6 +1128,24 @@ impl SplitContract {
         env.storage()
             .persistent()
             .set(&nonce_key(invoice_id, payer), &(stored_nonce + 1));
+
+        // Velocity limiting per (invoice, payer) (new feature).
+        if invoice.velocity_limit > 0 {
+            let now = env.ledger().timestamp();
+            let mut window: (u64, i128) = env
+                .storage()
+                .persistent()
+                .get(&vel_key(invoice_id, payer))
+                .unwrap_or((0u64, 0i128));
+            if now > window.0 + invoice.velocity_window {
+                // reset window
+                window.0 = now;
+                window.1 = 0;
+            }
+            assert!(window.1 + amount <= invoice.velocity_limit, "velocity limit exceeded");
+            window.1 += amount;
+            env.storage().persistent().set(&vel_key(invoice_id, payer), &window);
+        }
 
         let token_client = token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
         
@@ -1857,6 +1897,44 @@ impl SplitContract {
         save_invoice(&env, invoice_id, &invoice);
     }
 
+    /// Partially release `amount` from a pending invoice to recipients proportionally.
+    /// Requires creator auth. Does not change invoice status (remains Pending).
+    pub fn partial_release(env: Env, invoice_id: u64, creator: Address, amount: i128) {
+        require_not_paused(&env);
+        creator.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+        assert!(invoice.creator == creator, "only creator can call partial_release");
+        assert!(!invoice.frozen, "invoice is frozen");
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
+        assert!(amount > 0, "amount must be positive");
+        assert!(amount <= invoice.funded, "amount exceeds funded balance");
+
+        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+
+        let total_amounts: i128 = invoice.amounts.iter().sum();
+        let n = invoice.recipients.len();
+        let mut distributed: i128 = 0;
+        for i in 0..n {
+            let recipient = invoice.recipients.get(i).unwrap();
+            let recip_amount = invoice.amounts.get(i).unwrap();
+            let share = if i == n - 1 {
+                amount - distributed
+            } else {
+                ((amount as u128) * (recip_amount as u128) / (total_amounts as u128)) as i128
+            };
+            distributed += share;
+            if share > 0 {
+                token_client.transfer(&env.current_contract_address(), &recipient, &share);
+            }
+        }
+
+        invoice.funded -= amount;
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("part_rel"), &creator);
+        events::invoice_partially_released(&env, invoice_id, &invoice.recipients);
+    }
+
     /// Full immediate release (no tranches).
     /// Issue #89: Returns stake to creator on successful release.
     /// Issue #41: Swaps recipient payout via DEX if swap_tokens[i] is set.
@@ -2076,6 +2154,37 @@ impl SplitContract {
             invoice.insurance_fund = 0;
         }
 
+        // Forward any leftover (rounding remainder) to configured forward target.
+        let leftover = funded.checked_sub(distributed).unwrap_or(0);
+        if leftover > 0 {
+            if let Some(addr) = invoice.forward_to.as_ref() {
+                token_client.transfer(&env.current_contract_address(), addr, &leftover);
+            } else if let Some(target_id) = invoice.forward_invoice_id {
+                // Credit the target invoice internally (acts like an internal pay from this contract).
+                let mut target = load_invoice(&env, target_id);
+                target.payments.push_back(Payment { payer: env.current_contract_address(), amount: leftover, tip: 0 });
+                target.funded += leftover;
+                // If target becomes fully funded, trigger auto-release where applicable.
+                let target_total: i128 = target.amounts.iter().sum();
+                if target.funded >= target_total {
+                    let in_group = env.storage().persistent().has(&invoice_group_key(target_id));
+                    let guarded =
+                        target.prerequisite_id.is_some()
+                            || !target.tranches.is_empty()
+                            || !target.release_stages.is_empty()
+                            || in_group
+                            || !target.co_signers.is_empty();
+                    if guarded {
+                        save_invoice(env, target_id, &target);
+                    } else {
+                        Self::_release(env, target_id, &mut target, &env.current_contract_address());
+                    }
+                } else {
+                    save_invoice(env, target_id, &target);
+                }
+            }
+        }
+
         invoice.status = InvoiceStatus::Released;
         invoice.completion_time = Some(env.ledger().timestamp());
         if invoice.insurance_fund > 0 {
@@ -2160,9 +2269,10 @@ impl SplitContract {
                 Vec::new(env),
                 0,
                 None,
+                None,
+                None,
                 0,
-                false,
-                false,
+                0,
                 Vec::new(env),
                 Vec::new(env),
                 Vec::new(env),
@@ -2334,7 +2444,13 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
         );
-        assert!(invoice.creator == caller, "only creator can cancel");
+        // If a creator cosigner is set, require both the creator and cosigner auths.
+        if let Some(ref cos) = invoice.creator_cosigner {
+            invoice.creator.require_auth();
+            cos.require_auth();
+        } else {
+            assert!(invoice.creator == caller, "only creator can cancel");
+        }
 
         // Issue: check cancellation rate limit before allowing cancel.
         let inv_cnt: u64 = env
@@ -2489,14 +2605,20 @@ impl SplitContract {
             "new deadline must be after current deadline"
         );
 
-        // Accept caller = creator OR assigned delegate (issue #43).
-        let delegate: Option<Address> = env
-            .storage()
-            .persistent()
-            .get(&delegate_key(invoice_id));
-        let is_creator = invoice.creator == caller;
-        let is_delegate = delegate.map(|d| d == caller).unwrap_or(false);
-        assert!(is_creator || is_delegate, "not authorized");
+        // If a creator cosigner is set, require both creator and cosigner auths.
+        if let Some(ref cos) = invoice.creator_cosigner {
+            invoice.creator.require_auth();
+            cos.require_auth();
+        } else {
+            // Accept caller = creator OR assigned delegate (issue #43).
+            let delegate: Option<Address> = env
+                .storage()
+                .persistent()
+                .get(&delegate_key(invoice_id));
+            let is_creator = invoice.creator == caller;
+            let is_delegate = delegate.map(|d| d == caller).unwrap_or(false);
+            assert!(is_creator || is_delegate, "not authorized");
+        }
 
         invoice.deadline = new_deadline;
         save_invoice(&env, invoice_id, &invoice);
@@ -2560,6 +2682,11 @@ impl SplitContract {
             old_invoice.smart_route,
             old_invoice.convert_to_stream,
             old_invoice.accepted_tokens.clone(),
+            old_invoice.forward_to,
+            old_invoice.forward_invoice_id,
+            old_invoice.creator_cosigner,
+            old_invoice.velocity_limit,
+            old_invoice.velocity_window,
             old_invoice.split_rules.clone(),
             old_invoice.auto_resolve_rules.clone(),
         );
@@ -2663,7 +2790,13 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
         );
-        assert!(invoice.creator == caller, "only creator can adjust split");
+        // If a creator cosigner is set, require both creator and cosigner auths.
+        if let Some(ref cos) = invoice.creator_cosigner {
+            invoice.creator.require_auth();
+            cos.require_auth();
+        } else {
+            assert!(invoice.creator == caller, "only creator can adjust split");
+        }
         assert!(invoice.funded == 0, "payments already received");
         assert!(
             new_amounts.len() == invoice.recipients.len(),
@@ -2755,6 +2888,12 @@ impl SplitContract {
             0,
             false,
             false,
+            Vec::new(&env),
+            None,
+            None,
+            None,
+            0,
+            0,
             Vec::new(&env),
             Vec::new(&env),
             Vec::new(&env),

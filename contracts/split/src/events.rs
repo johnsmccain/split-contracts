@@ -99,3 +99,13 @@ pub fn delegate_revoked(env: &Env, invoice_id: u64) {
         (),
     );
 }
+
+/// Emitted when an invoice is partially released.
+/// Topics: (split, part_rel, invoice_id)
+/// Data: recipients
+pub fn invoice_partially_released(env: &Env, invoice_id: u64, recipients: &Vec<Address>) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("part_rel"), invoice_id),
+        recipients.clone(),
+    );
+}

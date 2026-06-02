@@ -41,6 +41,9 @@ fn default_options(env: &Env) -> InvoiceOptions {
         allow_early_withdrawal: false,
         bonus_pool: 0,
         bonus_max_payers: 0,
+        creator_cosigner: None,
+        velocity_limit: 0,
+        velocity_window: 0,
         prerequisite_id: None,
         tranches: Vec::new(env),
         co_signers: Vec::new(env),
@@ -57,6 +60,8 @@ fn default_options(env: &Env) -> InvoiceOptions {
         smart_route: None,
         convert_to_stream: false,
         accepted_tokens: Vec::new(env),
+        forward_to: None,
+        forward_invoice_id: None,
     }
 }
 
@@ -313,6 +318,80 @@ fn test_transfer_invoice() {
     assert_eq!(c.get_invoice(&id1).status, InvoiceStatus::Released);
     assert_eq!(c.get_invoice(&id2).status, InvoiceStatus::Released);
     assert_eq!(tk.balance(&recipient), 200);
+}
+
+#[test]
+fn test_partial_release_distributes_and_decrements_funded() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &200);
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    amounts.push_back(300_i128);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env));
+
+    // Payer funds 200
+    c.pay(&payer, &id, &200_i128, &0_u64, &false);
+    assert_eq!(c.get_invoice(&id).funded, 200);
+
+    // Creator partially releases 100 -> r1 gets 25, r2 gets 75
+    c.partial_release(&id, &creator, &100_i128);
+    assert_eq!(tk.balance(&r1), 25);
+    assert_eq!(tk.balance(&r2), 75);
+    assert_eq!(c.get_invoice(&id).funded, 100);
+}
+
+#[test]
+fn test_forward_to_invoice_credits_target_invoice() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let parent = Address::generate(&env); // not used as address, just generate ids
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &200);
+    env.ledger().set_timestamp(1_000);
+
+    // Create child invoice that forwards to parent invoice id 2
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+
+    let mut opts = default_options(&env);
+    opts.forward_invoice_id = Some(2);
+
+    let id1 = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Create parent invoice id 2
+    let mut recipients2 = Vec::new(&env);
+    recipients2.push_back(Address::generate(&env));
+    let mut amounts2 = Vec::new(&env);
+    amounts2.push_back(200_i128);
+    let id2 = c.create_invoice(&creator, &recipients2, &amounts2, &token_id, &9_999_u64, &default_options(&env));
+    assert_eq!(id2, 2);
+
+    // Pay child invoice fully (100)
+    c.pay(&payer, &id1, &100_i128, &0_u64, &false);
+
+    // After release, parent invoice funded should be credited with forwarded amount (leftover after distribution)
+    let parent_invoice = c.get_invoice(&id2);
+    assert!(parent_invoice.funded > 0);
 }
 
 #[test]
