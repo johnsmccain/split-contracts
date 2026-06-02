@@ -377,6 +377,7 @@ impl SplitContract {
             options.swap_tokens,
             options.tax_bps.unwrap_or(0),
             options.tax_authority,
+            options.insurance_premium_bps.unwrap_or(0),
         )
     }
 
@@ -405,6 +406,7 @@ impl SplitContract {
         swap_tokens: Vec<Option<Address>>,
         tax_bps: u32,
         tax_authority: Option<Address>,
+        insurance_premium_bps: u32,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -416,6 +418,7 @@ impl SplitContract {
         assert!(penalty_bps <= 10_000, "penalty_bps must be ≤ 10000");
         assert!(min_funding_bps <= 10_000, "min_funding_bps must be ≤ 10000");
         assert!(tax_bps <= 10_000, "tax_bps must be ≤ 10000");
+        assert!(insurance_premium_bps <= 10_000, "insurance_premium_bps must be ≤ 10000");
         if tax_bps > 0 {
             assert!(tax_authority.is_some(), "tax_authority must be set if tax_bps > 0");
         }
@@ -536,6 +539,8 @@ impl SplitContract {
             swap_tokens,
             tax_bps,
             tax_authority,
+            insurance_premium_bps,
+            insurance_fund: 0,
         };
 
         save_invoice(env, id, &invoice);
@@ -601,6 +606,7 @@ impl SplitContract {
                 Vec::new(&env),
                 0,
                 None,
+                0,
             );
             ids.push_back(id);
         }
@@ -652,6 +658,7 @@ impl SplitContract {
             Vec::new(&env),
             0,
             None,
+            0,
         );
 
         if months > 1 {
@@ -734,18 +741,23 @@ impl SplitContract {
 
         let token_client = token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
         
+        let premium = (amount as u128 * invoice.insurance_premium_bps as u128 / 10_000u128) as i128;
+        let total_charge = amount + premium;
+
         // Issue #88: Auto-convert if requested.
         let credited_amount = if auto_convert {
             // In production, this would call a DEX swap contract.
             // For now, we assume a 1:1 swap and transfer the amount directly.
             // Mock DEX swap: payer's source asset -> invoice token.
             // The swapped amount is what gets credited.
-            token_client.transfer(payer, &env.current_contract_address(), &amount);
+            token_client.transfer(payer, &env.current_contract_address(), &total_charge);
             amount // In a real implementation, this would be the swapped output amount.
         } else {
-            token_client.transfer(payer, &env.current_contract_address(), &amount);
+            token_client.transfer(payer, &env.current_contract_address(), &total_charge);
             amount
         };
+        
+        invoice.insurance_fund += premium;
 
         // Penalty for late payment (issue #42).
         if invoice.penalty_bps > 0 && env.ledger().timestamp() > invoice.penalty_deadline {
@@ -1110,6 +1122,10 @@ impl SplitContract {
         if invoice.released_bps >= 10_000 {
             invoice.status = InvoiceStatus::Released;
             invoice.completion_time = Some(now);
+            if invoice.insurance_fund > 0 {
+                token_client.transfer(&env.current_contract_address(), &invoice.creator, &invoice.insurance_fund);
+                invoice.insurance_fund = 0;
+            }
             append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
             events::invoice_released(env, invoice_id, &invoice.recipients);
         }
@@ -1227,6 +1243,10 @@ impl SplitContract {
         if invoice.released_stages >= invoice.release_stages.len() {
             invoice.status = InvoiceStatus::Released;
             invoice.completion_time = Some(now);
+            if invoice.insurance_fund > 0 {
+                token_client.transfer(&env.current_contract_address(), &invoice.creator, &invoice.insurance_fund);
+                invoice.insurance_fund = 0;
+            }
             append_audit_entry(&env, invoice_id, symbol_short!("stg_rel"), &creator);
             events::invoice_released(&env, invoice_id, &invoice.recipients);
         } else {
@@ -1411,6 +1431,11 @@ impl SplitContract {
 
         invoice.status = InvoiceStatus::Released;
         invoice.completion_time = Some(env.ledger().timestamp());
+        if invoice.insurance_fund > 0 {
+            let token_client = token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
+            token_client.transfer(&env.current_contract_address(), &invoice.creator, &invoice.insurance_fund);
+            invoice.insurance_fund = 0;
+        }
         save_invoice(env, invoice_id, invoice);
         append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
         events::invoice_released(env, invoice_id, &invoice.recipients);
@@ -1467,6 +1492,7 @@ impl SplitContract {
                 Vec::new(env),
                 0,
                 None,
+                0,
             );
             env.storage()
                 .persistent()
@@ -1575,6 +1601,22 @@ impl SplitContract {
                     &invoice.creator,
                     &invoice.bonus_pool,
                 );
+            }
+
+            if invoice.insurance_fund > 0 {
+                let mut total_paid: i128 = 0;
+                for (_, amt) in totals.iter() {
+                    total_paid += amt;
+                }
+                if total_paid > 0 {
+                    for (payer, amt) in totals.iter() {
+                        let share = (invoice.insurance_fund as u128 * amt as u128 / total_paid as u128) as i128;
+                        if share > 0 {
+                            token_client.transfer(&env.current_contract_address(), &payer, &share);
+                        }
+                    }
+                }
+                invoice.insurance_fund = 0;
             }
 
             invoice.status = InvoiceStatus::Refunded;

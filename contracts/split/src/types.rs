@@ -122,6 +122,7 @@ pub struct InvoiceOptions {
     pub swap_tokens: Vec<Option<Address>>,
     pub tax_bps: Option<u32>,
     pub tax_authority: Option<Address>,
+    pub insurance_premium_bps: Option<u32>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -217,6 +218,8 @@ pub struct Invoice {
     pub swap_tokens: Vec<Option<Address>>,
     pub tax_bps: u32,
     pub tax_authority: Option<Address>,
+    pub insurance_premium_bps: u32,
+    pub insurance_fund: i128,
 }
 
 /// Issue #144: Payment analytics for an invoice, callable by external contracts.
@@ -278,6 +281,8 @@ impl Invoice {
             swap_tokens: Vec::new(env),
             tax_bps: 0,
             tax_authority: None,
+            insurance_premium_bps: 0,
+            insurance_fund: 0,
         }
     }
 }
