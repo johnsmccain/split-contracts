@@ -3767,3 +3767,91 @@ fn test_remove_creator_from_whitelist() {
     let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
     assert_eq!(id, 1);
 }
+
+
+#[test]
+fn test_creator_stats_increments_on_operations() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let creator2 = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let recipient1 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer1, &2000);
+    sa.mint(&payer2, &2000);
+    env.ledger().set_timestamp(1_000);
+
+    // Initially, creator has no stats
+    let (count, volume, released, refunded) = c.get_creator_stats(&creator);
+    assert_eq!(count, 0);
+    assert_eq!(volume, 0);
+    assert_eq!(released, 0);
+    assert_eq!(refunded, 0);
+
+    // Create first invoice (count should increment)
+    let id1 = make_invoice(&env, &c, &creator, &recipient1, 100, &token_id, 9_999);
+    let (count, volume, released, refunded) = c.get_creator_stats(&creator);
+    assert_eq!(count, 1);
+    assert_eq!(volume, 0);
+    assert_eq!(released, 0);
+    assert_eq!(refunded, 0);
+
+    // Pay and release first invoice (volume and released should increment)
+    c.pay(&payer1, &id1, &100_i128, &0_u64, &false);
+    let (count, volume, released, refunded) = c.get_creator_stats(&creator);
+    assert_eq!(count, 1);
+    assert_eq!(volume, 100);
+    assert_eq!(released, 1);
+    assert_eq!(refunded, 0);
+
+    // Create second invoice
+    let id2 = make_invoice(&env, &c, &creator, &recipient2, 200, &token_id, 2_000);
+    let (count, volume, released, refunded) = c.get_creator_stats(&creator);
+    assert_eq!(count, 2);
+    assert_eq!(volume, 100);
+    assert_eq!(released, 1);
+    assert_eq!(refunded, 0);
+
+    // Partially pay second invoice and let it expire for refund
+    c.pay(&payer2, &id2, &50_i128, &0_u64, &false);
+    env.ledger().set_timestamp(3_000);
+    c.refund(&id2);
+
+    let (count, volume, released, refunded) = c.get_creator_stats(&creator);
+    assert_eq!(count, 2);
+    assert_eq!(volume, 100); // Only released amounts count toward volume
+    assert_eq!(released, 1);
+    assert_eq!(refunded, 1);
+
+    // Create third invoice and fully release it
+    let id3 = make_invoice(&env, &c, &creator, &recipient1, 300, &token_id, 9_999);
+    c.pay(&payer1, &id3, &300_i128, &0_u64, &false);
+
+    let (count, volume, released, refunded) = c.get_creator_stats(&creator);
+    assert_eq!(count, 3);
+    assert_eq!(volume, 400);
+    assert_eq!(released, 2);
+    assert_eq!(refunded, 1);
+
+    // Verify another creator's stats are independent
+    let id4 = make_invoice(&env, &c, &creator2, &recipient1, 500, &token_id, 9_999);
+    c.pay(&payer1, &id4, &500_i128, &0_u64, &false);
+
+    let (count, volume, released, refunded) = c.get_creator_stats(&creator2);
+    assert_eq!(count, 1);
+    assert_eq!(volume, 500);
+    assert_eq!(released, 1);
+    assert_eq!(refunded, 0);
+
+    // Creator1 stats should remain unchanged
+    let (count, volume, released, refunded) = c.get_creator_stats(&creator);
+    assert_eq!(count, 3);
+    assert_eq!(volume, 400);
+    assert_eq!(released, 2);
+    assert_eq!(refunded, 1);
+}

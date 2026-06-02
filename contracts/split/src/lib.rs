@@ -139,6 +139,23 @@ fn compliance_key() -> Symbol {
     symbol_short!("comply")
 }
 
+/// Per-creator analytics keys (issue #106).
+fn creator_stats_count_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("cstats_cnt"), creator.clone())
+}
+
+fn creator_stats_volume_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("cstats_vol"), creator.clone())
+}
+
+fn creator_stats_released_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("cstats_rel"), creator.clone())
+}
+
+fn creator_stats_refunded_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("cstats_ref"), creator.clone())
+}
+
 // ---------------------------------------------------------------------------
 // Invoice storage helpers
 // ---------------------------------------------------------------------------
@@ -707,6 +724,17 @@ impl SplitContract {
         env.storage().persistent().set(
             &total_invoices_key(),
             &total_invoices.checked_add(1).expect("total_invoices overflow"),
+        );
+
+        // Increment creator invoice count (issue #106).
+        let creator_count: u64 = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_count_key(&creator))
+            .unwrap_or(0u64);
+        env.storage().persistent().set(
+            &creator_stats_count_key(&creator),
+            &creator_count.checked_add(1).expect("creator count overflow"),
         );
 
         id
@@ -1969,6 +1997,27 @@ impl SplitContract {
             &total_released.checked_add(funded).expect("total_released overflow"),
         );
 
+        // Increment creator analytics (issue #106).
+        let creator_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_volume_key(&invoice.creator))
+            .unwrap_or(0i128);
+        env.storage().persistent().set(
+            &creator_stats_volume_key(&invoice.creator),
+            &creator_volume.checked_add(funded).expect("creator_volume overflow"),
+        );
+
+        let creator_released: u64 = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_released_key(&invoice.creator))
+            .unwrap_or(0u64);
+        env.storage().persistent().set(
+            &creator_stats_released_key(&invoice.creator),
+            &creator_released.checked_add(1).expect("creator_released overflow"),
+        );
+
         // Spin up next subscription invoice if one is scheduled.
         if let Some(params) = env
             .storage()
@@ -2069,6 +2118,17 @@ impl SplitContract {
         env.storage().persistent().set(
             &total_refunded_key(),
             &total_refunded.checked_add(total_refunded_amount).expect("total_refunded overflow"),
+        );
+
+        // Increment creator refund counter (issue #106).
+        let creator_refunded: u64 = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_refunded_key(&invoice.creator))
+            .unwrap_or(0u64);
+        env.storage().persistent().set(
+            &creator_stats_refunded_key(&invoice.creator),
+            &creator_refunded.checked_add(1).expect("creator_refunded overflow"),
         );
     }
 
@@ -2761,6 +2821,36 @@ impl SplitContract {
             .persistent()
             .get(&recipient_invoice_ids_key(&recipient))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns creator analytics: (count, volume, released, refunded).
+    ///
+    /// - count: total number of invoices created
+    /// - volume: total amount released across all invoices
+    /// - released: number of invoices successfully released
+    /// - refunded: number of invoices refunded
+    pub fn get_creator_stats(env: Env, creator: Address) -> (u64, i128, u64, u64) {
+        let count = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_count_key(&creator))
+            .unwrap_or(0u64);
+        let volume = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_volume_key(&creator))
+            .unwrap_or(0i128);
+        let released = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_released_key(&creator))
+            .unwrap_or(0u64);
+        let refunded = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_refunded_key(&creator))
+            .unwrap_or(0u64);
+        (count, volume, released, refunded)
     }
 
     /// Returns true if the invoice exists and its status matches `expected_status`.
