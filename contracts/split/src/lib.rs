@@ -86,6 +86,11 @@ fn referral_count_key(referrer: &Address) -> (Symbol, Address) {
 }
 
 /// Per-payer per-invoice nonce key (issue #21).
+
+fn channel_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("chan"), invoice_id, payer.clone())
+}
+
 fn nonce_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("nonce"), invoice_id, payer.clone())
 }
@@ -725,6 +730,87 @@ impl SplitContract {
         assert_eq!(total_funded, invoice.funded, "total funded changed after compression");
 
         save_invoice(&env, invoice_id, &invoice);
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Payment Channel (Issue #1)
+    // -----------------------------------------------------------------------
+
+    pub fn open_channel(env: Env, payer: Address, invoice_id: u64, deposit: i128) {
+        require_not_paused(&env);
+        payer.require_auth();
+        assert!(deposit > 0, "deposit must be positive");
+
+        let invoice = load_invoice(&env, invoice_id);
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
+
+        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        token_client.transfer(&payer, &env.current_contract_address(), &deposit);
+
+        // Store (balance, deposited)
+        let state: (i128, i128) = (deposit, deposit);
+        env.storage().persistent().set(&channel_key(invoice_id, &payer), &state);
+    }
+
+    pub fn channel_pay(env: Env, payer: Address, invoice_id: u64, amount: i128) {
+        require_not_paused(&env);
+        payer.require_auth();
+        assert!(amount > 0, "amount must be positive");
+
+        let mut state: (i128, i128) = env.storage().persistent().get(&channel_key(invoice_id, &payer)).expect("channel not found");
+        assert!(state.0 >= amount, "insufficient channel balance");
+
+        state.0 -= amount;
+        env.storage().persistent().set(&channel_key(invoice_id, &payer), &state);
+    }
+
+    pub fn close_channel(env: Env, payer: Address, invoice_id: u64) {
+        require_not_paused(&env);
+        payer.require_auth();
+
+        let state: (i128, i128) = env.storage().persistent().get(&channel_key(invoice_id, &payer)).expect("channel not found");
+        let balance = state.0;
+        let deposited = state.1;
+        let net_paid = deposited - balance;
+
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        if net_paid > 0 {
+            assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
+
+            invoice.payments.push_back(Payment { payer: payer.clone(), amount: net_paid, tip: 0 });
+            invoice.funded += net_paid;
+
+            // In real app we might handle penalty/oracle, but for simplicity:
+            events::payment_received(&env, invoice_id, &payer, net_paid);
+            
+            let total: i128 = invoice.amounts.iter().sum();
+            
+            if invoice.funded >= total {
+                let in_group = env.storage().persistent().has(&invoice_group_key(invoice_id));
+                let guarded =
+                    invoice.prerequisite_id.is_some()
+                        || !invoice.tranches.is_empty()
+                        || !invoice.release_stages.is_empty()
+                        || in_group
+                        || !invoice.co_signers.is_empty();
+                if guarded {
+                    save_invoice(&env, invoice_id, &invoice);
+                } else {
+                    Self::_release(&env, invoice_id, &mut invoice, &payer);
+                }
+            } else {
+                save_invoice(&env, invoice_id, &invoice);
+            }
+        }
+
+        if balance > 0 {
+            let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+            token_client.transfer(&env.current_contract_address(), &payer, &balance);
+        }
+
+        env.storage().persistent().remove(&channel_key(invoice_id, &payer));
     }
 
     pub fn pay(env: Env, payer: Address, invoice_id: u64, amount: i128, nonce: u64, auto_convert: bool) {

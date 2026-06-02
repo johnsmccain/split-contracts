@@ -3396,3 +3396,54 @@ fn test_governance_rejection() {
     // Total = 15_000 >= 10_000, so it should be rejected
     make_invoice(&env, &c, &creator, &recipient, 15_000, &token_id, 9_999);
 }
+
+#[test]
+fn test_payment_channel() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer, &1000);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
+
+    c.open_channel(&payer, &id, &400_i128);
+    c.channel_pay(&payer, &id, &100_i128);
+    c.channel_pay(&payer, &id, &50_i128);
+    c.channel_pay(&payer, &id, &50_i128);
+
+    c.close_channel(&payer, &id);
+
+    let inv = c.get_invoice(&id);
+    assert_eq!(inv.funded, 200);
+
+    let tk = token_client(&env, &token_id);
+    assert_eq!(tk.balance(&payer), 800); // 1000 - 400 + 200 refund
+}
+
+#[test]
+#[should_panic(expected = "insufficient channel balance")]
+fn test_payment_channel_insufficient() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer, &1000);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
+
+    c.open_channel(&payer, &id, &100_i128);
+    c.channel_pay(&payer, &id, &150_i128); // Panics
+}
