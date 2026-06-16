@@ -69,6 +69,7 @@ fn default_options(env: &Env) -> InvoiceOptions {
         oracle_address: None,
         cross_chain_ref: None,
         allowed_payers: None,
+        min_funding_amount: None,
     }
 }
 
@@ -4117,4 +4118,62 @@ fn test_creator_stats_increments_on_operations() {
     assert_eq!(volume, 400);
     assert_eq!(released, 2);
     assert_eq!(refunded, 1);
+}
+
+#[test]
+fn test_min_funding_amount_delays_release() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    // Total = 100 but min_funding_amount = 200, so fully paying 100 should not auto-release.
+    let mut opts = default_options(&env);
+    opts.min_funding_amount = Some(200);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    c.pay(&payer, &id, &100_i128, &0_u64, &false);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.funded, 100);
+    assert_eq!(invoice.status, InvoiceStatus::Pending);
+}
+
+#[test]
+fn test_min_funding_amount_releases_when_met() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    // Total = 100, min_funding_amount = 50 — fully paying 100 meets both thresholds.
+    let mut opts = default_options(&env);
+    opts.min_funding_amount = Some(50);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    c.pay(&payer, &id, &100_i128, &0_u64, &false);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.funded, 100);
+    assert_eq!(invoice.status, InvoiceStatus::Released);
 }

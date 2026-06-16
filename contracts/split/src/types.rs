@@ -203,6 +203,8 @@ pub struct InvoiceOptions {
     pub cross_chain_ref: Option<String>,
     /// Issue #98: restrict payments to this allowlist; None = open.
     pub allowed_payers: Option<Vec<Address>>,
+    /// Absolute minimum funded amount required before auto-release triggers.
+    pub min_funding_amount: Option<i128>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -312,6 +314,7 @@ pub struct InvoiceExt2 {
     pub auction_end: u64,
     pub bids: Vec<Bid>,
     pub min_payment: i128,
+    pub min_funding_amount: i128,
 }
 
 /// Full invoice — assembled from InvoiceCore + InvoiceExt + InvoiceExt2.
@@ -377,6 +380,7 @@ pub struct Invoice {
     pub auction_end: u64,
     pub bids: Vec<Bid>,
     pub min_payment: i128,
+    pub min_funding_amount: i128,
 }
 
 impl Invoice {
@@ -446,6 +450,7 @@ impl Invoice {
                 auction_end: self.auction_end,
                 bids: self.bids,
                 min_payment: self.min_payment,
+                min_funding_amount: self.min_funding_amount,
             },
         )
     }
@@ -511,6 +516,7 @@ impl Invoice {
             auction_end: ext2.auction_end,
             bids: ext2.bids,
             min_payment: ext2.min_payment,
+            min_funding_amount: ext2.min_funding_amount,
         }
     }
 }
@@ -597,6 +603,7 @@ impl Invoice {
             notification_contract: None,
             overflow_behavior: OverflowBehavior::Reject,
             cross_chain_ref: None,
+            min_funding_amount: 0,
         }
     }
 }

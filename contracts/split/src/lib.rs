@@ -304,6 +304,7 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             auction_end: 0,
             bids: Vec::new(env),
             min_payment: 0,
+            min_funding_amount: 0,
         });
     Invoice::assemble(core, ext, ext2)
 }
@@ -696,6 +697,7 @@ impl SplitContract {
             options.auto_resolve_rules,
             options.cross_chain_ref,
             options.allowed_payers,
+            options.min_funding_amount.unwrap_or(0),
         )
     }
 
@@ -739,6 +741,7 @@ impl SplitContract {
         auto_resolve_rules: Vec<ResolveRule>,
         cross_chain_ref: Option<String>,
         allowed_payers: Option<Vec<Address>>,
+        min_funding_amount: i128,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -962,6 +965,7 @@ impl SplitContract {
             auction_end: 0,
             bids: Vec::new(env),
             min_payment: 0,
+            min_funding_amount,
         };
 
         save_invoice(env, id, &invoice);
@@ -1086,6 +1090,7 @@ impl SplitContract {
                 Vec::new(&env),
                 None,
                 None,
+                0,
             );
             ids.push_back(id);
         }
@@ -1153,6 +1158,7 @@ impl SplitContract {
             Vec::new(&env),
             None,
             None,
+            0,
         );
 
         if months > 1 {
@@ -1285,7 +1291,8 @@ impl SplitContract {
                         || !invoice.release_stages.is_empty()
                         || in_group
                         || !invoice.co_signers.is_empty()
-                        || (invoice.oracle_address.is_some() && !invoice.condition_met);
+                        || (invoice.oracle_address.is_some() && !invoice.condition_met)
+                        || (invoice.min_funding_amount > 0 && invoice.funded < invoice.min_funding_amount);
                 if guarded {
                     save_invoice(&env, invoice_id, &invoice);
                 } else {
@@ -1534,7 +1541,8 @@ impl SplitContract {
                     || !invoice.release_stages.is_empty()
                     || in_group
                     || !invoice.co_signers.is_empty()
-                    || (invoice.oracle_address.is_some() && !invoice.condition_met);
+                    || (invoice.oracle_address.is_some() && !invoice.condition_met)
+                    || (invoice.min_funding_amount > 0 && invoice.funded < invoice.min_funding_amount);
             if guarded {
                 save_invoice(env, invoice_id, &invoice);
             } else {
@@ -1633,7 +1641,8 @@ impl SplitContract {
                     || !invoice.tranches.is_empty()
                     || !invoice.release_stages.is_empty()
                     || in_group
-                    || !invoice.co_signers.is_empty();
+                    || !invoice.co_signers.is_empty()
+                    || (invoice.min_funding_amount > 0 && invoice.funded < invoice.min_funding_amount);
             if guarded {
                 save_invoice(&env, invoice_id, &invoice);
             } else {
@@ -1695,7 +1704,8 @@ impl SplitContract {
                     || !invoice.release_stages.is_empty()
                     || in_group
                     || !invoice.co_signers.is_empty()
-                    || (invoice.oracle_address.is_some() && !invoice.condition_met);
+                    || (invoice.oracle_address.is_some() && !invoice.condition_met)
+                    || (invoice.min_funding_amount > 0 && invoice.funded < invoice.min_funding_amount);
             if guarded {
                 save_invoice(&env, invoice_id, &invoice);
             } else {
@@ -1771,7 +1781,8 @@ impl SplitContract {
                         || !inv.release_stages.is_empty()
                         || in_group
                         || !inv.co_signers.is_empty()
-                        || (inv.oracle_address.is_some() && !inv.condition_met);
+                        || (inv.oracle_address.is_some() && !inv.condition_met)
+                        || (inv.min_funding_amount > 0 && inv.funded < inv.min_funding_amount);
                 if guarded {
                     save_invoice(&env, p.invoice_id, &inv);
                 } else {
@@ -2732,6 +2743,7 @@ impl SplitContract {
                 Vec::new(env),
                 None,
                 None,
+                0,
             );
             env.storage()
                 .persistent()
@@ -3260,6 +3272,7 @@ impl SplitContract {
             old_invoice.auto_resolve_rules.clone(),
             old_invoice.cross_chain_ref.clone(),
             None,
+            old_invoice.min_funding_amount,
         );
 
         // Load the newly created invoice and copy over the payments.
@@ -3472,6 +3485,7 @@ impl SplitContract {
             Vec::new(&env),
             None,
             None,
+            0,
         )
     }
 
@@ -3900,7 +3914,7 @@ impl SplitContract {
             .unwrap_or_else(|| InvoiceExt2 {
                 notification_contract: None, overflow_behavior: OverflowBehavior::Reject,
                 cross_chain_ref: None, require_kyc: false, auction_on_expiry: false,
-                auction_end: 0, bids: Vec::new(&env), min_payment: 0,
+                auction_end: 0, bids: Vec::new(&env), min_payment: 0, min_funding_amount: 0,
             });
 
         // Copy to instance storage.
