@@ -130,32 +130,12 @@ pub fn payment_matched(env: &Env, invoice_id: u64, memo: u64, payer: &Address) {
     );
 }
 
-/// Emitted when a creator pauses an invoice.
-/// Topics: (split, paused, invoice_id)
-/// Data: (creator, reason, auto_resume_at)
-pub fn invoice_paused(env: &Env, invoice_id: u64, creator: &Address, reason: &String, auto_resume_at: &Option<u64>) {
+/// Emitted when an invoice is cloned.
+/// Topics: (cloned, source_id, new_id)
+/// Data: ()
+pub fn invoice_cloned(env: &Env, source_id: u64, new_id: u64) {
     env.events().publish(
-        (symbol_short!("split"), symbol_short!("paused"), invoice_id),
-        (creator.clone(), reason.clone(), auto_resume_at.clone()),
-    );
-}
-
-/// Emitted when a creator resumes a paused invoice.
-/// Topics: (split, resumed, invoice_id)
-/// Data: creator
-pub fn invoice_resumed(env: &Env, invoice_id: u64, creator: &Address) {
-    env.events().publish(
-        (symbol_short!("split"), symbol_short!("resumed"), invoice_id),
-        creator.clone(),
-    );
-}
-
-/// Emitted when an admin force-resumes a paused invoice.
-/// Topics: (split, frc_rsm, invoice_id)
-/// Data: admin
-pub fn invoice_force_resumed(env: &Env, invoice_id: u64, admin: &Address) {
-    env.events().publish(
-        (symbol_short!("split"), symbol_short!("frc_rsm"), invoice_id),
-        admin.clone(),
+        (symbol_short!("cloned"), source_id, new_id),
+        (),
     );
 }

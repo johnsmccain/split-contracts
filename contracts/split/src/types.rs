@@ -1,5 +1,14 @@
 use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol, Vec, String};
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CloneOverrides {
+    pub new_deadline: Option<u64>,
+    pub new_amounts: Option<Vec<i128>>,
+    pub new_recipients: Option<Vec<Address>>,
+    pub new_overflow_behavior: Option<OverflowBehavior>,
+}
+
 /// Issue: Split rule for a single recipient — evaluated at release time.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -272,6 +281,7 @@ pub struct InvoiceCore {
     pub prerequisite_id: Option<u64>,
     pub tranches: Vec<Tranche>,
     pub released_bps: u32,
+    pub clone_depth: u32,
 }
 
 #[contracttype]
@@ -307,11 +317,7 @@ pub struct InvoiceExt {
     pub creator_cosigner: Option<Address>,
     pub velocity_limit: i128,
     pub velocity_window: u64,
-    pub pause_reason: Option<String>,
-    pub auto_resume_at: Option<u64>,
-    pub payment_cooldown_secs: Option<u64>,
-    pub max_payments_per_window: Option<u32>,
-    pub payment_window_secs: Option<u64>,
+    pub parent_invoice_id: Option<u64>,
 }
 
 #[contracttype]
@@ -397,6 +403,8 @@ pub struct Invoice {
     pub bids: Vec<Bid>,
     pub min_payment: i128,
     pub min_funding_amount: i128,
+    pub clone_depth: u32,
+    pub parent_invoice_id: Option<u64>,
 }
 
 impl Invoice {
@@ -424,6 +432,7 @@ impl Invoice {
                 prerequisite_id: self.prerequisite_id,
                 tranches: self.tranches,
                 released_bps: self.released_bps,
+                clone_depth: self.clone_depth,
             },
             InvoiceExt {
                 co_signers: self.co_signers,
@@ -456,11 +465,7 @@ impl Invoice {
                 creator_cosigner: self.creator_cosigner,
                 velocity_limit: self.velocity_limit,
                 velocity_window: self.velocity_window,
-                pause_reason: self.pause_reason,
-                auto_resume_at: self.auto_resume_at,
-                payment_cooldown_secs: self.payment_cooldown_secs,
-                max_payments_per_window: self.max_payments_per_window,
-                payment_window_secs: self.payment_window_secs,
+                parent_invoice_id: self.parent_invoice_id,
             },
             InvoiceExt2 {
                 notification_contract: self.notification_contract,
@@ -499,6 +504,7 @@ impl Invoice {
             prerequisite_id: core.prerequisite_id,
             tranches: core.tranches,
             released_bps: core.released_bps,
+            clone_depth: core.clone_depth,
             co_signers: ext.co_signers,
             required_signatures: ext.required_signatures,
             signatures: ext.signatures,
@@ -529,11 +535,7 @@ impl Invoice {
             creator_cosigner: ext.creator_cosigner,
             velocity_limit: ext.velocity_limit,
             velocity_window: ext.velocity_window,
-            pause_reason: ext.pause_reason,
-            auto_resume_at: ext.auto_resume_at,
-            payment_cooldown_secs: ext.payment_cooldown_secs,
-            max_payments_per_window: ext.max_payments_per_window,
-            payment_window_secs: ext.payment_window_secs,
+            parent_invoice_id: ext.parent_invoice_id,
             notification_contract: ext2.notification_contract,
             overflow_behavior: ext2.overflow_behavior,
             cross_chain_ref: ext2.cross_chain_ref,
@@ -635,6 +637,8 @@ impl Invoice {
             overflow_behavior: OverflowBehavior::Reject,
             cross_chain_ref: None,
             min_funding_amount: 0,
+            clone_depth: 0,
+            parent_invoice_id: None,
         }
     }
 }
