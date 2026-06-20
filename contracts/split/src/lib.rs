@@ -13,8 +13,8 @@ use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env, IntoVal, Map, Symbol, Val, Vec,
 };
 use types::{
-    AuditEntry, Bid, CompletionProof, CreateInvoiceParams, Invoice, InvoiceCore, InvoiceExt,
-    InvoiceExt2, InvoiceOptions, InvoicePayment, InvoiceStatus, InvoiceTemplate,
+    AuditEntry, Bid, CloneOverrides, CompletionProof, CreateInvoiceParams, Invoice, InvoiceCore,
+    InvoiceExt, InvoiceExt2, InvoiceOptions, InvoicePayment, InvoiceStatus, InvoiceTemplate,
     LegacyInvoice, OverflowBehavior, Payment, PaymentProof, ResolveAction, ResolveRule,
     SplitRule, SubscriptionParams, Tranche, TreasuryRecord,
 };
@@ -291,6 +291,7 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             creator_cosigner: None,
             velocity_limit: 0,
             velocity_window: 0,
+            parent_invoice_id: None,
         });
     let ext2: InvoiceExt2 = env.storage().persistent()
         .get(&invoice_ext2_key(id))
@@ -979,6 +980,8 @@ impl SplitContract {
             bids: Vec::new(env),
             min_payment: 0,
             min_funding_amount,
+            clone_depth: 0,
+            parent_invoice_id: None,
         };
 
         save_invoice(env, id, &invoice);
@@ -1189,6 +1192,150 @@ impl SplitContract {
             env.storage()
                 .persistent()
                 .set(&subscription_params_key(id), &params);
+        }
+
+        id
+    }
+
+    // -----------------------------------------------------------------------
+    // Invoice cloning
+    // -----------------------------------------------------------------------
+
+    /// Clone an existing invoice with optional field overrides.
+    ///
+    /// Copies all fields from `source_id` except: funded, status, payments, claimed,
+    /// released_bps, completion_time — those reset to their defaults.
+    /// The cloned invoice gets `clone_depth = source.clone_depth + 1` and
+    /// `parent_invoice_id = Some(source_id)`.
+    ///
+    /// Panics with "max clone depth exceeded" if `source.clone_depth >= 5`.
+    /// Panics with "not invoice creator" if `creator != source.creator`.
+    pub fn clone_invoice(
+        env: Env,
+        creator: Address,
+        source_id: u64,
+        overrides: CloneOverrides,
+    ) -> u64 {
+        require_not_paused(&env);
+        creator.require_auth();
+
+        let source = load_invoice(&env, source_id);
+
+        assert!(source.creator == creator, "not invoice creator");
+        assert!(source.clone_depth < 5, "max clone depth exceeded");
+
+        let recipients = overrides
+            .new_recipients
+            .unwrap_or_else(|| source.recipients.clone());
+        let amounts = overrides
+            .new_amounts
+            .unwrap_or_else(|| source.amounts.clone());
+        let deadline = overrides.new_deadline.unwrap_or(source.deadline);
+        let overflow_behavior = overrides
+            .new_overflow_behavior
+            .unwrap_or_else(|| source.overflow_behavior.clone());
+
+        let token = source.tokens.get(0).expect("no token");
+
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&counter_key())
+            .unwrap_or(0u64)
+            + 1;
+        env.storage().persistent().set(&counter_key(), &id);
+
+        let mut tokens: Vec<Address> = Vec::new(&env);
+        for _ in recipients.iter() {
+            tokens.push_back(token.clone());
+        }
+
+        let mut claimed: Vec<i128> = Vec::new(&env);
+        for _ in recipients.iter() {
+            claimed.push_back(0i128);
+        }
+
+        let new_invoice = Invoice {
+            version: source.version,
+            creator: source.creator.clone(),
+            co_creators: source.co_creators.clone(),
+            recipients: recipients.clone(),
+            base_amounts: amounts.clone(),
+            amounts,
+            tokens,
+            deadline,
+            // Reset fields per spec
+            funded: 0,
+            status: InvoiceStatus::Pending,
+            payments: Vec::new(&env),
+            claimed,
+            released_bps: 0,
+            completion_time: None,
+            // Clone lineage
+            clone_depth: source.clone_depth + 1,
+            parent_invoice_id: Some(source_id),
+            // Copy remaining fields from source
+            drip_duration: source.drip_duration,
+            release_timestamp: source.release_timestamp,
+            frozen: source.frozen,
+            allow_early_withdrawal: source.allow_early_withdrawal,
+            bonus_pool: source.bonus_pool,
+            bonus_max_payers: source.bonus_max_payers,
+            prerequisite_id: source.prerequisite_id,
+            tranches: source.tranches.clone(),
+            co_signers: source.co_signers.clone(),
+            required_signatures: source.required_signatures,
+            signatures: source.signatures.clone(),
+            approver: source.approver.clone(),
+            approved: source.approved,
+            oracle_address: source.oracle_address.clone(),
+            condition_met: source.condition_met,
+            penalty_bps: source.penalty_bps,
+            penalty_deadline: source.penalty_deadline,
+            min_funding_bps: source.min_funding_bps,
+            release_stages: source.release_stages.clone(),
+            released_stages: source.released_stages,
+            allowed_payers: source.allowed_payers.clone(),
+            price_oracle: source.price_oracle.clone(),
+            swap_tokens: source.swap_tokens.clone(),
+            tax_bps: source.tax_bps,
+            tax_authority: source.tax_authority.clone(),
+            insurance_premium_bps: source.insurance_premium_bps,
+            insurance_fund: source.insurance_fund,
+            smart_route: source.smart_route,
+            convert_to_stream: source.convert_to_stream,
+            accepted_tokens: source.accepted_tokens.clone(),
+            forward_to: source.forward_to.clone(),
+            forward_invoice_id: source.forward_invoice_id,
+            split_rules: source.split_rules.clone(),
+            auto_resolve_rules: source.auto_resolve_rules.clone(),
+            creator_cosigner: source.creator_cosigner.clone(),
+            velocity_limit: source.velocity_limit,
+            velocity_window: source.velocity_window,
+            notification_contract: source.notification_contract.clone(),
+            overflow_behavior,
+            cross_chain_ref: source.cross_chain_ref.clone(),
+            require_kyc: source.require_kyc,
+            auction_on_expiry: source.auction_on_expiry,
+            auction_end: source.auction_end,
+            bids: source.bids.clone(),
+            min_payment: source.min_payment,
+            min_funding_amount: source.min_funding_amount,
+        };
+
+        save_invoice(&env, id, &new_invoice);
+        events::invoice_cloned(&env, source_id, id);
+
+        // Index each recipient -> invoice ID.
+        for recipient in recipients.iter() {
+            let key = recipient_invoice_ids_key(&recipient);
+            let mut ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(&env));
+            ids.push_back(id);
+            env.storage().persistent().set(&key, &ids);
         }
 
         id

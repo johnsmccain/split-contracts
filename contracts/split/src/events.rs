@@ -129,3 +129,13 @@ pub fn payment_matched(env: &Env, invoice_id: u64, memo: u64, payer: &Address) {
         (memo, payer.clone()),
     );
 }
+
+/// Emitted when an invoice is cloned.
+/// Topics: (cloned, source_id, new_id)
+/// Data: ()
+pub fn invoice_cloned(env: &Env, source_id: u64, new_id: u64) {
+    env.events().publish(
+        (symbol_short!("cloned"), source_id, new_id),
+        (),
+    );
+}

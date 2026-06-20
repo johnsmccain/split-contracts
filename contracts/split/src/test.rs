@@ -4283,3 +4283,172 @@ fn test_cooldown_and_rate_limit_independent() {
     c.pay(&payer, &id, &100_i128);
     c.pay(&other_payer, &id, &100_i128);
 }
+
+// ---------------------------------------------------------------------------
+// Invoice cloning tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_clone_copies_recipients_and_amounts() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient1 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient1.clone());
+    recipients.push_back(recipient2.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    amounts.push_back(200_i128);
+
+    let source_id = c.create_invoice(
+        &creator,
+        &recipients,
+        &amounts,
+        &token_id,
+        &9_999,
+        &default_options(&env),
+    );
+
+    let overrides = types::CloneOverrides {
+        new_deadline: None,
+        new_amounts: None,
+        new_recipients: None,
+        new_overflow_behavior: None,
+    };
+    let clone_id = c.clone_invoice(&creator, &source_id, &overrides);
+
+    let clone = c.get_invoice(&clone_id);
+    assert_eq!(clone.recipients, recipients);
+    assert_eq!(clone.amounts, amounts);
+    assert_eq!(clone.clone_depth, 1);
+
+    let clone_ext = c.get_invoice_ext(&clone_id);
+    assert_eq!(clone_ext.parent_invoice_id, Some(source_id));
+}
+
+#[test]
+fn test_clone_with_overrides_replaces_fields() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let original_recipient = Address::generate(&env);
+    let new_recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let source_id = make_invoice(
+        &env,
+        &c,
+        &creator,
+        &original_recipient,
+        100,
+        &token_id,
+        9_999,
+    );
+
+    let mut new_recipients = Vec::new(&env);
+    new_recipients.push_back(new_recipient.clone());
+    let mut new_amounts = Vec::new(&env);
+    new_amounts.push_back(500_i128);
+
+    let overrides = types::CloneOverrides {
+        new_deadline: Some(19_999),
+        new_amounts: Some(new_amounts.clone()),
+        new_recipients: Some(new_recipients.clone()),
+        new_overflow_behavior: Some(types::OverflowBehavior::Refund),
+    };
+    let clone_id = c.clone_invoice(&creator, &source_id, &overrides);
+
+    let clone = c.get_invoice(&clone_id);
+    assert_eq!(clone.recipients, new_recipients);
+    assert_eq!(clone.amounts, new_amounts);
+    assert_eq!(clone.deadline, 19_999);
+
+    let clone_ext2 = c.get_invoice_ext2(&clone_id);
+    assert_eq!(clone_ext2.overflow_behavior, types::OverflowBehavior::Refund);
+}
+
+#[test]
+#[should_panic(expected = "max clone depth exceeded")]
+fn test_clone_depth_limit_enforced() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let base_overrides = types::CloneOverrides {
+        new_deadline: None,
+        new_amounts: None,
+        new_recipients: None,
+        new_overflow_behavior: None,
+    };
+
+    let id0 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    assert_eq!(c.get_invoice(&id0).clone_depth, 0);
+
+    let id1 = c.clone_invoice(&creator, &id0, &base_overrides);
+    assert_eq!(c.get_invoice(&id1).clone_depth, 1);
+
+    let id2 = c.clone_invoice(&creator, &id1, &base_overrides);
+    assert_eq!(c.get_invoice(&id2).clone_depth, 2);
+
+    let id3 = c.clone_invoice(&creator, &id2, &base_overrides);
+    assert_eq!(c.get_invoice(&id3).clone_depth, 3);
+
+    let id4 = c.clone_invoice(&creator, &id3, &base_overrides);
+    assert_eq!(c.get_invoice(&id4).clone_depth, 4);
+
+    let id5 = c.clone_invoice(&creator, &id4, &base_overrides);
+    assert_eq!(c.get_invoice(&id5).clone_depth, 5);
+
+    // 6th clone (source at depth 5) must panic.
+    c.clone_invoice(&creator, &id5, &base_overrides);
+}
+
+#[test]
+fn test_clone_resets_payment_state() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let sa = StellarAssetClient::new(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    sa.mint(&payer, &50);
+    env.ledger().set_timestamp(1_000);
+
+    let source_id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Partially fund the source invoice.
+    c.pay(&payer, &source_id, &50_i128, &0_u64, &false);
+
+    let source = c.get_invoice(&source_id);
+    assert_eq!(source.funded, 50);
+    assert_eq!(source.payments.len(), 1);
+
+    let overrides = types::CloneOverrides {
+        new_deadline: None,
+        new_amounts: None,
+        new_recipients: None,
+        new_overflow_behavior: None,
+    };
+    let clone_id = c.clone_invoice(&creator, &source_id, &overrides);
+
+    let clone = c.get_invoice(&clone_id);
+    assert_eq!(clone.funded, 0);
+    assert_eq!(clone.payments.len(), 0);
+    assert_eq!(clone.status, InvoiceStatus::Pending);
+    assert_eq!(clone.released_bps, 0);
+    assert!(clone.completion_time.is_none());
+}
