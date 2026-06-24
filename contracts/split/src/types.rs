@@ -76,6 +76,13 @@ pub enum InvoiceStatus {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum AdminRole {
+    SuperAdmin,
+    Operator,
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct Payment {
     pub payer: Address,

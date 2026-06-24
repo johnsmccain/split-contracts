@@ -169,3 +169,13 @@ pub fn invoice_force_resumed(env: &Env, invoice_id: u64, admin: &Address) {
         admin.clone(),
     );
 }
+
+/// Emitted when a creator issues a voluntary partial refund.
+/// Topics: (split, part_ref, invoice_id)
+/// Data: (creator, bps, total_refunded)
+pub fn partial_refund_issued(env: &Env, invoice_id: u64, creator: &Address, bps: u32, total_refunded: i128) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("part_ref"), invoice_id),
+        (creator.clone(), bps, total_refunded),
+    );
+}
