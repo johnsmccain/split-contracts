@@ -226,6 +226,8 @@ pub struct InvoiceOptions {
     pub payment_window_secs: Option<u64>,
     /// Issue: per-recipient release priorities (parallel to recipients); empty = no ordering.
     pub priorities: Vec<u32>,
+    /// Issue #195: require KYC verification for all recipients at creation time.
+    pub require_kyc: bool,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -338,6 +340,10 @@ pub struct InvoiceExt2 {
     pub overflow_behavior: OverflowBehavior,
     pub cross_chain_ref: Option<String>,
     pub require_kyc: bool,
+    /// Issue #188: arbiter address that can raise and resolve disputes.
+    pub arbiter: Option<Address>,
+    /// Issue #188: whether this invoice is under active dispute.
+    pub disputed: bool,
     pub auction_on_expiry: bool,
     pub auction_end: u64,
     pub bids: Vec<Bid>,
@@ -411,6 +417,8 @@ pub struct Invoice {
     pub overflow_behavior: OverflowBehavior,
     pub cross_chain_ref: Option<String>,
     pub require_kyc: bool,
+    pub arbiter: Option<Address>,
+    pub disputed: bool,
     pub auction_on_expiry: bool,
     pub auction_end: u64,
     pub bids: Vec<Bid>,
@@ -492,6 +500,8 @@ impl Invoice {
                 overflow_behavior: self.overflow_behavior,
                 cross_chain_ref: self.cross_chain_ref,
                 require_kyc: self.require_kyc,
+                arbiter: self.arbiter,
+                disputed: self.disputed,
                 auction_on_expiry: self.auction_on_expiry,
                 auction_end: self.auction_end,
                 bids: self.bids,
@@ -566,6 +576,8 @@ impl Invoice {
             overflow_behavior: ext2.overflow_behavior,
             cross_chain_ref: ext2.cross_chain_ref,
             require_kyc: ext2.require_kyc,
+            arbiter: ext2.arbiter,
+            disputed: ext2.disputed,
             auction_on_expiry: ext2.auction_on_expiry,
             auction_end: ext2.auction_end,
             bids: ext2.bids,
@@ -644,6 +656,8 @@ impl Invoice {
             convert_to_stream: false,
             accepted_tokens: Vec::new(env),
             require_kyc: false,
+            arbiter: None,
+            disputed: false,
             auction_on_expiry: false,
             auction_end: 0,
             bids: Vec::new(env),
