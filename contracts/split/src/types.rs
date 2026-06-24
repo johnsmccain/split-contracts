@@ -224,6 +224,8 @@ pub struct InvoiceOptions {
     pub max_payments_per_window: Option<u32>,
     /// Window duration in seconds for payment rate limiting (issue #168).
     pub payment_window_secs: Option<u64>,
+    /// Issue: per-recipient release priorities (parallel to recipients); empty = no ordering.
+    pub priorities: Vec<u32>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -341,6 +343,8 @@ pub struct InvoiceExt2 {
     pub bids: Vec<Bid>,
     pub min_payment: i128,
     pub min_funding_amount: i128,
+    /// Issue: per-recipient release priority (ascending = higher priority); empty = no priority ordering.
+    pub priorities: Vec<u32>,
 }
 
 /// Full invoice — assembled from InvoiceCore + InvoiceExt + InvoiceExt2.
@@ -414,6 +418,8 @@ pub struct Invoice {
     pub min_funding_amount: i128,
     pub clone_depth: u32,
     pub parent_invoice_id: Option<u64>,
+    /// Issue: per-recipient release priority (ascending = higher priority); empty = no priority ordering.
+    pub priorities: Vec<u32>,
 }
 
 impl Invoice {
@@ -491,6 +497,7 @@ impl Invoice {
                 bids: self.bids,
                 min_payment: self.min_payment,
                 min_funding_amount: self.min_funding_amount,
+                priorities: self.priorities,
             },
         )
     }
@@ -564,6 +571,7 @@ impl Invoice {
             bids: ext2.bids,
             min_payment: ext2.min_payment,
             min_funding_amount: ext2.min_funding_amount,
+            priorities: ext2.priorities,
         }
     }
 }
@@ -658,6 +666,7 @@ impl Invoice {
             min_funding_amount: 0,
             clone_depth: 0,
             parent_invoice_id: None,
+            priorities: Vec::new(env),
         }
     }
 }
