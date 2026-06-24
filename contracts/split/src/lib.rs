@@ -318,6 +318,7 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             bids: Vec::new(env),
             min_payment: 0,
             min_funding_amount: 0,
+            priorities: Vec::new(env),
         });
     Invoice::assemble(core, ext, ext2)
 }
@@ -727,6 +728,7 @@ impl SplitContract {
             options.payment_cooldown_secs,
             options.max_payments_per_window,
             options.payment_window_secs,
+            options.priorities,
         )
     }
 
@@ -774,6 +776,7 @@ impl SplitContract {
         payment_cooldown_secs: Option<u64>,
         max_payments_per_window: Option<u32>,
         payment_window_secs: Option<u64>,
+        priorities: Vec<u32>,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -788,6 +791,12 @@ impl SplitContract {
         assert!(insurance_premium_bps <= 10_000, "insurance_premium_bps must be ≤ 10000");
         if tax_bps > 0 {
             assert!(tax_authority.is_some(), "tax_authority must be set if tax_bps > 0");
+        }
+        if !priorities.is_empty() {
+            assert!(
+                priorities.len() == recipients.len(),
+                "priorities length must match recipients"
+            );
         }
 
         for amt in amounts.iter() {
@@ -1005,6 +1014,7 @@ impl SplitContract {
             min_funding_amount,
             clone_depth: 0,
             parent_invoice_id: None,
+            priorities,
         };
 
         save_invoice(env, id, &invoice);
@@ -1133,6 +1143,7 @@ impl SplitContract {
                 None,
                 None,
                 None,
+                Vec::new(&env), // priorities
             );
             ids.push_back(id);
         }
@@ -1204,6 +1215,7 @@ impl SplitContract {
             None,
             None,
             None,
+            Vec::new(&env), // priorities
         );
 
         if months > 1 {
@@ -1350,6 +1362,7 @@ impl SplitContract {
             bids: source.bids.clone(),
             min_payment: source.min_payment,
             min_funding_amount: source.min_funding_amount,
+            priorities: source.priorities.clone(),
         };
 
         save_invoice(&env, id, &new_invoice);
@@ -2616,7 +2629,10 @@ impl SplitContract {
         save_invoice(&env, invoice_id, &invoice);
     }
 
-    /// Partially release `amount` from a pending invoice to recipients proportionally.
+    /// Partially release `amount` from a pending invoice to recipients in priority order.
+    /// When `priorities` is set, recipients are paid in ascending priority (lowest number first)
+    /// until `amount` is exhausted. Recipients whose full amount cannot be covered are skipped.
+    /// When no priorities are set, funds are distributed proportionally (original behaviour).
     /// Requires creator auth. Does not change invoice status (remains Pending).
     pub fn partial_release(env: Env, invoice_id: u64, creator: Address, amount: i128) {
         require_not_paused(&env);
@@ -2631,20 +2647,70 @@ impl SplitContract {
 
         let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
 
-        let total_amounts: i128 = invoice.amounts.iter().sum();
         let n = invoice.recipients.len();
-        let mut distributed: i128 = 0;
-        for i in 0..n {
-            let recipient = invoice.recipients.get(i).unwrap();
-            let recip_amount = invoice.amounts.get(i).unwrap();
-            let share = if i == n - 1 {
-                amount - distributed
-            } else {
-                ((amount as u128) * (recip_amount as u128) / (total_amounts as u128)) as i128
-            };
-            distributed += share;
-            if share > 0 {
-                token_client.transfer(&env.current_contract_address(), &recipient, &share);
+        let use_priorities = !invoice.priorities.is_empty();
+
+        if use_priorities {
+            // Build a sorted index list (ascending by priority) via selection sort.
+            // We maintain a "remaining" pool of indices and repeatedly pick the minimum.
+            let mut pool: Vec<u32> = Vec::new(&env);
+            for i in 0..n {
+                pool.push_back(i);
+            }
+
+            let mut sorted_indices: Vec<u32> = Vec::new(&env);
+            let pool_len = pool.len();
+            for _ in 0..pool_len {
+                // Find position in pool with lowest priority.
+                let mut best_pos: u32 = 0;
+                let mut best_pri: u32 = u32::MAX;
+                for pos in 0..pool.len() {
+                    let idx = pool.get(pos).unwrap();
+                    let p = invoice.priorities.get(idx).unwrap();
+                    if p < best_pri {
+                        best_pri = p;
+                        best_pos = pos;
+                    }
+                }
+                let chosen = pool.get(best_pos).unwrap();
+                sorted_indices.push_back(chosen);
+                // Remove chosen from pool by rebuilding without it.
+                let mut new_pool: Vec<u32> = Vec::new(&env);
+                for pos in 0..pool.len() {
+                    if pos != best_pos {
+                        new_pool.push_back(pool.get(pos).unwrap());
+                    }
+                }
+                pool = new_pool;
+            }
+
+            let mut remaining = amount;
+            for k in 0..n {
+                let idx = sorted_indices.get(k).unwrap();
+                let recipient = invoice.recipients.get(idx).unwrap();
+                let recip_amount = invoice.amounts.get(idx).unwrap();
+                if remaining >= recip_amount {
+                    token_client.transfer(&env.current_contract_address(), &recipient, &recip_amount);
+                    remaining -= recip_amount;
+                }
+                // Skip recipients whose full amount cannot be covered.
+            }
+        } else {
+            // Original proportional distribution.
+            let total_amounts: i128 = invoice.amounts.iter().sum();
+            let mut distributed: i128 = 0;
+            for i in 0..n {
+                let recipient = invoice.recipients.get(i).unwrap();
+                let recip_amount = invoice.amounts.get(i).unwrap();
+                let share = if i == n - 1 {
+                    amount - distributed
+                } else {
+                    ((amount as u128) * (recip_amount as u128) / (total_amounts as u128)) as i128
+                };
+                distributed += share;
+                if share > 0 {
+                    token_client.transfer(&env.current_contract_address(), &recipient, &share);
+                }
             }
         }
 
@@ -3039,6 +3105,7 @@ impl SplitContract {
                 None,
                 None,
                 None,
+                Vec::new(env), // priorities
             );
             env.storage()
                 .persistent()
@@ -3571,6 +3638,7 @@ impl SplitContract {
             old_invoice.payment_cooldown_secs,
             old_invoice.max_payments_per_window,
             old_invoice.payment_window_secs,
+            old_invoice.priorities.clone(),
         );
 
         // Load the newly created invoice and copy over the payments.
@@ -3787,12 +3855,9 @@ impl SplitContract {
             None,
             None,
             None,
+            Vec::new(&env), // priorities
         )
     }
-
-    // -----------------------------------------------------------------------
-    // Group
-    // -----------------------------------------------------------------------
 
     /// Link invoices into a group: all must be fully funded before any can be released.
     pub fn create_invoice_group(env: Env, invoice_ids: Vec<u64>) -> u64 {
@@ -4217,6 +4282,7 @@ impl SplitContract {
                 notification_contract: None, overflow_behavior: OverflowBehavior::Reject,
                 cross_chain_ref: None, require_kyc: false, auction_on_expiry: false,
                 auction_end: 0, bids: Vec::new(&env), min_payment: 0, min_funding_amount: 0,
+                priorities: Vec::new(&env),
             });
 
         // Copy to instance storage.

@@ -73,6 +73,7 @@ fn default_options(env: &Env) -> InvoiceOptions {
         payment_cooldown_secs: None,
         max_payments_per_window: None,
         payment_window_secs: None,
+        priorities: Vec::new(env),
     }
 }
 
@@ -119,6 +120,7 @@ fn invoice_options(
         payment_cooldown_secs: cooldown_secs,
         max_payments_per_window: max_payments,
         payment_window_secs: window_secs,
+        priorities: Vec::new(env),
     }
 }
 
@@ -4656,4 +4658,65 @@ fn test_clone_resets_payment_state() {
     assert_eq!(clone.status, InvoiceStatus::Pending);
     assert_eq!(clone.released_bps, 0);
     assert!(clone.completion_time.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Priority-ordered partial release
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_partial_release_priority_order() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    // Three recipients with amounts 100, 200, 300.
+    // Priorities: r1=3 (lowest priority), r2=1 (highest), r3=2 (middle).
+    // With only 300 available, priority order is r2(200), r3(300), r1(100).
+    // r2 gets paid (200 remaining after = 100), r3 cannot be fully paid (needs 300), skip.
+    // r1 cannot be fully paid either (needs 100, but only 100 left — actually 100 == 100 so r1 gets paid).
+    // Wait: 300 - 200 = 100 left, r3 needs 300 > 100 → skip, r1 needs 100 == 100 → paid.
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &600);
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    recipients.push_back(r3.clone());
+
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128); // r1
+    amounts.push_back(200_i128); // r2
+    amounts.push_back(300_i128); // r3
+
+    let mut priorities = Vec::new(&env);
+    priorities.push_back(3_u32); // r1 — lowest priority
+    priorities.push_back(1_u32); // r2 — highest priority
+    priorities.push_back(2_u32); // r3 — middle priority
+
+    let mut opts = default_options(&env);
+    opts.priorities = priorities;
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Fund 300 tokens — enough to pay r2 fully and r1 fully, but not r3.
+    c.pay(&payer, &id, &300_i128, &0_u64, &false);
+    assert_eq!(c.get_invoice(&id).funded, 300);
+
+    // Partial release of 300: order is r2(priority=1), r3(priority=2), r1(priority=3).
+    // r2 paid 200 → remaining 100. r3 needs 300 > 100 → skipped. r1 needs 100 == 100 → paid.
+    c.partial_release(&id, &creator, &300_i128);
+
+    assert_eq!(tk.balance(&r2), 200, "r2 (priority 1) should be paid first");
+    assert_eq!(tk.balance(&r1), 100, "r1 (priority 3) paid after r3 skipped");
+    assert_eq!(tk.balance(&r3), 0,   "r3 (priority 2) skipped — insufficient funds");
+
+    // funded should be decremented by the full release_amount regardless of how much was transferred
+    assert_eq!(c.get_invoice(&id).funded, 0);
 }
