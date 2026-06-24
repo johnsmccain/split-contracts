@@ -4352,6 +4352,221 @@ fn test_cooldown_and_rate_limit_independent() {
 }
 
 // ---------------------------------------------------------------------------
+// Invariant tests
+// ---------------------------------------------------------------------------
+
+/// Helper: compute the invoice total from its amounts vec.
+fn invoice_total(invoice: &InvoiceCore) -> i128 {
+    invoice.amounts.iter().sum()
+}
+
+/// Invariant: invoice.funded never exceeds total across all valid payment sequences.
+///
+/// Parameterised over several (total, payment_sequence) combinations.
+#[test]
+fn invariant_funded_never_exceeds_total() {
+    // Each case: (invoice_total, payments)
+    let cases: &[(i128, &[i128])] = &[
+        (100, &[50, 50]),
+        (300, &[100, 100, 100]),
+        (500, &[200, 300]),
+        (1000, &[1, 999]),
+        (1000, &[250, 250, 250, 250]),
+        (50, &[50]),
+        (400, &[100, 100, 100, 100]),
+    ];
+
+    for (total_amount, payments) in cases {
+        let (env, contract_id, token_id) = setup();
+        let c = client(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        StellarAssetClient::new(&env, &token_id).mint(&creator, &1_000_000);
+        // Mint to a shared payer used for all payments.
+        let payer = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000_000);
+
+        env.ledger().set_timestamp(1_000);
+
+        let id = make_invoice(&env, &c, &creator, &recipient, *total_amount, &token_id, 9_999_999);
+        let total = invoice_total(&c.get_invoice(&id));
+
+        let mut nonce: u64 = 0;
+        for &payment in *payments {
+            c.pay(&payer, &id, &payment, &nonce, &false);
+            nonce += 1;
+
+            // Invariant: funded must never exceed total at any point.
+            let inv = c.get_invoice(&id);
+            assert!(
+                inv.funded <= total,
+                "funded ({}) exceeded total ({}) after payment of {}",
+                inv.funded,
+                total,
+                payment
+            );
+        }
+    }
+}
+
+/// Invariant: status transitions are monotonic — only Pending→Released and
+/// Pending→Refunded are valid forward transitions; status never regresses.
+#[test]
+fn invariant_status_monotonic() {
+    // --- Case 1: Pending → Released (via full payment) ---
+    {
+        let (env, contract_id, token_id) = setup();
+        let c = client(&env, &contract_id);
+        let creator = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+        env.ledger().set_timestamp(1_000);
+
+        let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999_999);
+        assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+
+        c.pay(&payer, &id, &200, &0, &false);
+        let status = c.get_invoice(&id).status;
+        assert_eq!(status, InvoiceStatus::Released);
+        // Must not go back to Pending.
+        assert_ne!(status, InvoiceStatus::Pending);
+    }
+
+    // --- Case 2: Pending → Refunded (via expired deadline) ---
+    {
+        let (env, contract_id, token_id) = setup();
+        let c = client(&env, &contract_id);
+        let creator = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+        env.ledger().set_timestamp(1_000);
+
+        let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+        assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+
+        c.pay(&payer, &id, &100, &0, &false);
+        assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+
+        env.ledger().set_timestamp(3_000);
+        c.refund(&id);
+        let status = c.get_invoice(&id).status;
+        assert_eq!(status, InvoiceStatus::Refunded);
+        assert_ne!(status, InvoiceStatus::Pending);
+        assert_ne!(status, InvoiceStatus::Released);
+    }
+
+    // --- Case 3: Pending → Cancelled ---
+    {
+        let (env, contract_id, token_id) = setup();
+        let c = client(&env, &contract_id);
+        let creator = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        env.ledger().set_timestamp(1_000);
+
+        let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999_999);
+        assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+
+        c.cancel_invoice(&creator, &id);
+        let status = c.get_invoice(&id).status;
+        assert_eq!(status, InvoiceStatus::Cancelled);
+        assert_ne!(status, InvoiceStatus::Pending);
+    }
+
+    // --- Case 4: Partial payments stay Pending until fully funded ---
+    {
+        let (env, contract_id, token_id) = setup();
+        let c = client(&env, &contract_id);
+        let creator = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+        env.ledger().set_timestamp(1_000);
+
+        let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999_999);
+
+        for (nonce, amount) in [(0u64, 100i128), (1, 100)] {
+            c.pay(&payer, &id, &amount, &nonce, &false);
+            assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+        }
+        c.pay(&payer, &id, &100, &2, &false);
+        assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    }
+}
+
+/// Invariant: the contract's token balance equals invoice.funded for a simple
+/// single-invoice scenario at every state-changing step.
+#[test]
+fn invariant_balance_matches_funded() {
+    // Each case: (invoice_total, payments_before_release)
+    let cases: &[(i128, &[i128])] = &[
+        (100, &[100]),
+        (300, &[100, 100, 100]),
+        (500, &[200, 300]),
+        (400, &[150, 150, 100]),
+    ];
+
+    for (total_amount, payments) in cases {
+        let (env, contract_id, token_id) = setup();
+        let c = client(&env, &contract_id);
+        let tk = token_client(&env, &token_id);
+
+        let creator = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000_000);
+        env.ledger().set_timestamp(1_000);
+
+        let id = make_invoice(&env, &c, &creator, &recipient, *total_amount, &token_id, 9_999_999);
+
+        // Before any payment: both funded and contract balance are 0.
+        assert_eq!(c.get_invoice(&id).funded, 0);
+        assert_eq!(tk.balance(&contract_id), 0);
+
+        let last_idx = payments.len() - 1;
+        let mut nonce: u64 = 0;
+        for (i, &payment) in payments.iter().enumerate() {
+            c.pay(&payer, &id, &payment, &nonce, &false);
+            nonce += 1;
+
+            let inv = c.get_invoice(&id);
+
+            if i < last_idx {
+                // Intermediate payments: invoice still Pending, tokens held by contract.
+                assert_eq!(inv.status, InvoiceStatus::Pending);
+                assert_eq!(
+                    tk.balance(&contract_id),
+                    inv.funded,
+                    "contract balance ({}) != funded ({}) after {} of {} payments",
+                    tk.balance(&contract_id),
+                    inv.funded,
+                    i + 1,
+                    payments.len()
+                );
+            } else {
+                // Final payment triggers release; tokens move to recipient.
+                assert_eq!(inv.status, InvoiceStatus::Released);
+                // After release the contract holds 0 for this invoice's funds.
+                assert_eq!(
+                    tk.balance(&contract_id),
+                    0,
+                    "contract should hold 0 after release, got {}",
+                    tk.balance(&contract_id)
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pause mechanism tests
 // ---------------------------------------------------------------------------
 
