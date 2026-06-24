@@ -139,3 +139,39 @@ pub fn invoice_cloned(env: &Env, source_id: u64, new_id: u64) {
         (),
     );
 }
+
+/// Emitted when an invoice is paused.
+/// Topics: (split, paused, invoice_id)
+/// Data: (creator, reason, auto_resume_at)
+pub fn invoice_paused(
+    env: &Env,
+    invoice_id: u64,
+    creator: &Address,
+    reason: &String,
+    auto_resume_at: &Option<u64>,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("paused"), invoice_id),
+        (creator.clone(), reason.clone(), *auto_resume_at),
+    );
+}
+
+/// Emitted when an invoice is resumed.
+/// Topics: (split, resumed, invoice_id)
+/// Data: creator
+pub fn invoice_resumed(env: &Env, invoice_id: u64, creator: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("resumed"), invoice_id),
+        creator.clone(),
+    );
+}
+
+/// Emitted when an invoice is force resumed.
+/// Topics: (split, forced, invoice_id)
+/// Data: admin_addr
+pub fn invoice_force_resumed(env: &Env, invoice_id: u64, admin_addr: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("forced"), invoice_id),
+        admin_addr.clone(),
+    );
+}

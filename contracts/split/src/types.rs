@@ -1,12 +1,20 @@
 use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol, Vec, String};
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum OverflowBehavior {
+    Reject,
+    Refund,
+    Donate,
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct CloneOverrides {
     pub new_deadline: Option<u64>,
     pub new_amounts: Option<Vec<i128>>,
     pub new_recipients: Option<Vec<Address>>,
-    pub new_overflow_behavior: Option<OverflowBehavior>,
+    pub new_overflow_behavior: Option<Symbol>,
 }
 
 /// Issue: Split rule for a single recipient — evaluated at release time.
@@ -37,14 +45,6 @@ pub struct ResolveRule {
     /// Minimum funding threshold in basis points (e.g. 5000 = 50%).
     pub min_funded_bps: u32,
     pub action: ResolveAction,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum OverflowBehavior {
-    Reject,
-    Refund,
-    Donate,
 }
 
 /// Issue #: A single (invoice_id, amount) pair for pool_pay.
@@ -212,8 +212,6 @@ pub struct InvoiceOptions {
     pub cross_chain_ref: Option<String>,
     /// Issue #98: restrict payments to this allowlist; None = open.
     pub allowed_payers: Option<Vec<Address>>,
-    /// Absolute minimum funded amount required before auto-release triggers.
-    pub min_funding_amount: Option<i128>,
     /// Per-payer cooldown window in seconds (issue #168).
     pub payment_cooldown_secs: Option<u64>,
     /// Maximum payments allowed per window (issue #168).
@@ -318,6 +316,11 @@ pub struct InvoiceExt {
     pub velocity_limit: i128,
     pub velocity_window: u64,
     pub parent_invoice_id: Option<u64>,
+    pub pause_reason: Option<String>,
+    pub auto_resume_at: Option<u64>,
+    pub payment_cooldown_secs: Option<u64>,
+    pub max_payments_per_window: Option<u32>,
+    pub payment_window_secs: Option<u64>,
 }
 
 #[contracttype]
@@ -331,7 +334,6 @@ pub struct InvoiceExt2 {
     pub auction_end: u64,
     pub bids: Vec<Bid>,
     pub min_payment: i128,
-    pub min_funding_amount: i128,
 }
 
 /// Full invoice — assembled from InvoiceCore + InvoiceExt + InvoiceExt2.
@@ -389,6 +391,7 @@ pub struct Invoice {
     pub creator_cosigner: Option<Address>,
     pub velocity_limit: i128,
     pub velocity_window: u64,
+    pub parent_invoice_id: Option<u64>,
     pub pause_reason: Option<String>,
     pub auto_resume_at: Option<u64>,
     pub payment_cooldown_secs: Option<u64>,
@@ -402,9 +405,7 @@ pub struct Invoice {
     pub auction_end: u64,
     pub bids: Vec<Bid>,
     pub min_payment: i128,
-    pub min_funding_amount: i128,
     pub clone_depth: u32,
-    pub parent_invoice_id: Option<u64>,
 }
 
 impl Invoice {
@@ -466,6 +467,11 @@ impl Invoice {
                 velocity_limit: self.velocity_limit,
                 velocity_window: self.velocity_window,
                 parent_invoice_id: self.parent_invoice_id,
+                pause_reason: self.pause_reason,
+                auto_resume_at: self.auto_resume_at,
+                payment_cooldown_secs: self.payment_cooldown_secs,
+                max_payments_per_window: self.max_payments_per_window,
+                payment_window_secs: self.payment_window_secs,
             },
             InvoiceExt2 {
                 notification_contract: self.notification_contract,
@@ -476,7 +482,6 @@ impl Invoice {
                 auction_end: self.auction_end,
                 bids: self.bids,
                 min_payment: self.min_payment,
-                min_funding_amount: self.min_funding_amount,
             },
         )
     }
@@ -536,6 +541,11 @@ impl Invoice {
             velocity_limit: ext.velocity_limit,
             velocity_window: ext.velocity_window,
             parent_invoice_id: ext.parent_invoice_id,
+            pause_reason: ext.pause_reason,
+            auto_resume_at: ext.auto_resume_at,
+            payment_cooldown_secs: ext.payment_cooldown_secs,
+            max_payments_per_window: ext.max_payments_per_window,
+            payment_window_secs: ext.payment_window_secs,
             notification_contract: ext2.notification_contract,
             overflow_behavior: ext2.overflow_behavior,
             cross_chain_ref: ext2.cross_chain_ref,
@@ -544,7 +554,6 @@ impl Invoice {
             auction_end: ext2.auction_end,
             bids: ext2.bids,
             min_payment: ext2.min_payment,
-            min_funding_amount: ext2.min_funding_amount,
         }
     }
 }
@@ -636,7 +645,6 @@ impl Invoice {
             notification_contract: None,
             overflow_behavior: OverflowBehavior::Reject,
             cross_chain_ref: None,
-            min_funding_amount: 0,
             clone_depth: 0,
             parent_invoice_id: None,
         }
