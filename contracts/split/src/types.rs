@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol, Vec, String};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Symbol, Vec, String};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -69,6 +69,13 @@ pub enum InvoiceStatus {
     Released,
     Refunded,
     Cancelled,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum AdminRole {
+    SuperAdmin,
+    Operator,
 }
 
 #[contracttype]
@@ -218,6 +225,10 @@ pub struct InvoiceOptions {
     pub max_payments_per_window: Option<u32>,
     /// Window duration in seconds for payment rate limiting (issue #168).
     pub payment_window_secs: Option<u64>,
+    /// Issue: per-recipient release priorities (parallel to recipients); empty = no ordering.
+    pub priorities: Vec<u32>,
+    /// Issue #199: grace period in seconds after deadline before refund is allowed.
+    pub refund_grace_secs: Option<u64>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -397,6 +408,8 @@ pub struct Invoice {
     pub payment_cooldown_secs: Option<u64>,
     pub max_payments_per_window: Option<u32>,
     pub payment_window_secs: Option<u64>,
+    /// Issue #199: grace period in seconds after deadline before refund is allowed.
+    pub refund_grace_secs: Option<u64>,
     pub notification_contract: Option<Address>,
     pub overflow_behavior: OverflowBehavior,
     pub cross_chain_ref: Option<String>,
@@ -558,6 +571,21 @@ impl Invoice {
     }
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PaymentCertificate {
+    /// The invoice this certificate covers.
+    pub invoice_id: u64,
+    /// Total amount paid out to all recipients.
+    pub total: i128,
+    /// All recipient addresses that received funds.
+    pub recipients: Vec<Address>,
+    /// Ledger timestamp at which the invoice was released.
+    pub release_timestamp: u64,
+    /// SHA-256 hash over (invoice_id || total || release_timestamp), deterministic for the same data.
+    pub cert_hash: BytesN<32>,
+}
+
 /// Issue #144: Payment analytics for an invoice, callable by external contracts.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -576,7 +604,79 @@ pub struct InvoiceStats {
     pub completion_bps: u32,
 }
 
+/// Compact storage representation of Invoice — serializes InvoiceCore fields using minimal byte encoding.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CompactInvoice {
+    /// Serialized bytes: [status(1), funded(16), deadline(8), ...rest]
+    pub data: Bytes,
+}
+
 impl Invoice {
+    /// Convert Invoice to compact byte representation.
+    pub fn to_compact(&self, env: &Env) -> CompactInvoice {
+        let mut bytes = Bytes::new(env);
+        
+        // Pack status as 1 byte
+        let status_byte: u8 = match self.status {
+            InvoiceStatus::Pending => 0,
+            InvoiceStatus::Released => 1,
+            InvoiceStatus::Refunded => 2,
+            InvoiceStatus::Cancelled => 3,
+        };
+        bytes.push_back(status_byte);
+        
+        // Pack funded as 16 bytes (i128)
+        let funded_bytes = self.funded.to_be_bytes();
+        for byte in funded_bytes.iter() {
+            bytes.push_back(*byte);
+        }
+        
+        // Pack deadline as 8 bytes (u64)
+        let deadline_bytes = self.deadline.to_be_bytes();
+        for byte in deadline_bytes.iter() {
+            bytes.push_back(*byte);
+        }
+        
+        CompactInvoice { data: bytes }
+    }
+    
+    /// Restore Invoice from compact byte representation.
+    pub fn from_compact(compact: &CompactInvoice, core: InvoiceCore, ext: InvoiceExt, ext2: InvoiceExt2) -> Self {
+        let bytes = &compact.data;
+        
+        // Unpack status (1 byte)
+        let status_byte = bytes.get(0).unwrap();
+        let status = match status_byte {
+            0 => InvoiceStatus::Pending,
+            1 => InvoiceStatus::Released,
+            2 => InvoiceStatus::Refunded,
+            3 => InvoiceStatus::Cancelled,
+            _ => InvoiceStatus::Pending,
+        };
+        
+        // Unpack funded (16 bytes)
+        let mut funded_bytes = [0u8; 16];
+        for i in 0..16 {
+            funded_bytes[i] = bytes.get((1 + i) as u32).unwrap();
+        }
+        let funded = i128::from_be_bytes(funded_bytes);
+        
+        // Unpack deadline (8 bytes)
+        let mut deadline_bytes = [0u8; 8];
+        for i in 0..8 {
+            deadline_bytes[i] = bytes.get((17 + i) as u32).unwrap();
+        }
+        let deadline = u64::from_be_bytes(deadline_bytes);
+        
+        // Reconstruct full invoice with updated fields
+        let mut invoice = Invoice::assemble(core, ext, ext2);
+        invoice.status = status;
+        invoice.funded = funded;
+        invoice.deadline = deadline;
+        invoice
+    }
+
     /// Upgrade a legacy (pre-version) invoice to the current schema.
     /// New fields are filled with their default (empty / zero) values.
     pub fn from_legacy(old: LegacyInvoice, env: &Env) -> Self {
@@ -640,6 +740,7 @@ impl Invoice {
             payment_cooldown_secs: None,
             max_payments_per_window: None,
             payment_window_secs: None,
+            refund_grace_secs: None,
             forward_to: None,
             forward_invoice_id: None,
             notification_contract: None,
@@ -647,6 +748,7 @@ impl Invoice {
             cross_chain_ref: None,
             clone_depth: 0,
             parent_invoice_id: None,
+            priorities: Vec::new(env),
         }
     }
 }
