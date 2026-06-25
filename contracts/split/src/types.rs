@@ -630,6 +630,20 @@ pub struct TreasuryRecord {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum GroupMode {
+    AllOrNothing,
+    Majority,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InvoiceGroup {
+    pub invoice_ids: Vec<u64>,
+    pub mode: GroupMode,
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct InvoiceStats {
     pub funded: i128,
@@ -640,6 +654,15 @@ pub struct InvoiceStats {
 }
 
 /// Compact storage representation of Invoice — serializes InvoiceCore fields using minimal byte encoding.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InvoiceSnapshot {
+    pub core: InvoiceCore,
+    pub ext: InvoiceExt,
+    pub ext2: InvoiceExt2,
+    pub audit_log: Vec<AuditEntry>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct CompactInvoice {

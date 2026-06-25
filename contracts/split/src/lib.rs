@@ -63,6 +63,10 @@ fn creation_fee_key() -> Symbol {
 fn platform_fee_bps_key() -> Symbol {
     symbol_short!("plat_fee")
 }
+
+fn platform_fee_waiver_list_key() -> Symbol {
+    symbol_short!("fee_waivers")
+}
 fn treasury_key() -> Symbol {
     symbol_short!("treasury")
 }
@@ -493,10 +497,15 @@ fn require_fn_not_paused(env: &Env, name: &Symbol) {
 // ---------------------------------------------------------------------------
 
 fn load_group(env: &Env, group_id: u64) -> Vec<u64> {
-    env.storage()
-        .persistent()
-        .get(&group_key(group_id))
-        .expect("group not found")
+    // New groups are stored as InvoiceGroup; fall back for legacy Vec<u64> groups.
+    if let Some(grp) = env.storage().persistent().get::<_, types::InvoiceGroup>(&group_key(group_id)) {
+        grp.invoice_ids
+    } else {
+        env.storage()
+            .persistent()
+            .get(&group_key(group_id))
+            .expect("group not found")
+    }
 }
 
 fn group_all_funded(env: &Env, group_id: u64) -> bool {
@@ -508,6 +517,21 @@ fn group_all_funded(env: &Env, group_id: u64) -> bool {
         }
     }
     true
+}
+
+/// Issue #212: Returns true when strictly more than half the group members are fully funded.
+fn group_majority_funded(env: &Env, group_id: u64) -> bool {
+    let ids = load_group(env, group_id);
+    let total_members = ids.len();
+    let mut funded_count: u32 = 0;
+    for id in ids.iter() {
+        let inv = load_invoice(env, id);
+        let total: i128 = inv.amounts.iter().sum();
+        if inv.funded >= total {
+            funded_count += 1;
+        }
+    }
+    funded_count * 2 > total_members
 }
 
 fn treasury_record_for_invoice(env: &Env, invoice_id: u64) -> Option<(u64, TreasuryRecord)> {
@@ -1013,6 +1037,136 @@ impl SplitContract {
             }
         }
         env.storage().persistent().set(&creator_whitelist_key(), &new_wl);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #215: Configurable platform fee waiver list
+    // -----------------------------------------------------------------------
+
+    /// Add an address to the platform fee waiver list. Requires admin auth.
+    /// Addresses on this list will not be charged platform fees when they are recipients.
+    pub fn add_platform_fee_waiver(env: Env, admin: Address, address: Address) {
+        require_role(&env, &admin, AdminRole::SuperAdmin);
+        let mut waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        if !waivers.iter().any(|a| a == address) {
+            waivers.push_back(address);
+        }
+        env.storage().persistent().set(&platform_fee_waiver_list_key(), &waivers);
+    }
+
+    /// Remove an address from the platform fee waiver list. Requires admin auth.
+    pub fn remove_platform_fee_waiver(env: Env, admin: Address, address: Address) {
+        require_role(&env, &admin, AdminRole::SuperAdmin);
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_waivers: Vec<Address> = Vec::new(&env);
+        for a in waivers.iter() {
+            if a != address {
+                new_waivers.push_back(a);
+            }
+        }
+        env.storage().persistent().set(&platform_fee_waiver_list_key(), &new_waivers);
+    }
+
+    /// Check if an address is on the platform fee waiver list.
+    pub fn is_platform_fee_waived(env: Env, address: Address) -> bool {
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        waivers.iter().any(|a| a == address)
+    }
+
+    /// Get a consolidated invoice snapshot for off-chain audit.
+    pub fn get_invoice_snapshot(env: Env, invoice_id: u64) -> types::InvoiceSnapshot {
+        let core: types::InvoiceCore = env
+            .storage()
+            .persistent()
+            .get(&invoice_key(invoice_id))
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&invoice_key(invoice_id))
+                    .expect("invoice not found")
+            });
+        let ext: types::InvoiceExt = env
+            .storage()
+            .persistent()
+            .get(&invoice_ext_key(invoice_id))
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&invoice_ext_key(invoice_id))
+                    .unwrap_or_else(|| types::InvoiceExt {
+                        co_signers: Vec::new(&env),
+                        required_signatures: 0,
+                        signatures: Vec::new(&env),
+                        approver: None,
+                        approved: false,
+                        oracle_address: None,
+                        condition_met: false,
+                        penalty_bps: 0,
+                        penalty_deadline: 0,
+                        min_funding_bps: 0,
+                        release_stages: Vec::new(&env),
+                        released_stages: 0,
+                        allowed_payers: None,
+                        price_oracle: None,
+                        base_amounts: Vec::new(&env),
+                        swap_tokens: Vec::new(&env),
+                        tax_bps: 0,
+                        tax_authority: None,
+                        insurance_premium_bps: 0,
+                        insurance_fund: 0,
+                        smart_route: false,
+                        convert_to_stream: false,
+                        accepted_tokens: Vec::new(&env),
+                        forward_to: None,
+                        forward_invoice_id: None,
+                        split_rules: Vec::new(&env),
+                        auto_resolve_rules: Vec::new(&env),
+                        creator_cosigner: None,
+                        velocity_limit: 0,
+                        velocity_window: 0,
+                        parent_invoice_id: None,
+                        pause_reason: None,
+                        auto_resume_at: None,
+                        payment_cooldown_secs: None,
+                        max_payments_per_window: None,
+                        payment_window_secs: None,
+                    })
+            });
+        let ext2: types::InvoiceExt2 = env
+            .storage()
+            .persistent()
+            .get(&invoice_ext2_key(invoice_id))
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&invoice_ext2_key(invoice_id))
+                    .unwrap_or_else(|| types::InvoiceExt2 {
+                        notification_contract: None,
+                        overflow_behavior: types::OverflowBehavior::Reject,
+                        cross_chain_ref: None,
+                        require_kyc: false,
+                        arbiter: None,
+                        disputed: false,
+                        auction_on_expiry: false,
+                        auction_end: 0,
+                        bids: Vec::new(&env),
+                        min_payment: 0,
+                    })
+            });
+        let audit_log: Vec<types::AuditEntry> = get_audit_log(&env, invoice_id);
+        types::InvoiceSnapshot { core, ext, ext2, audit_log }
     }
 
     /// Return the current creation fee.
@@ -2186,7 +2340,7 @@ impl SplitContract {
         env.storage().persistent().remove(&channel_key(invoice_id, &payer));
     }
 
-    pub fn pay(env: Env, payer: Address, invoice_id: u64, amount: i128, nonce: u64, _auto_convert: bool) {
+    pub fn pay(env: Env, payer: Address, invoice_id: u64, amount: i128, nonce: u64, _auto_convert: bool, donate_on_failure: bool) {
         require_fn_not_paused(&env, &symbol_short!("pay"));
         payer.require_auth();
         Self::_pay(&env, &payer, invoice_id, amount, nonce, _auto_convert, None);
@@ -2839,13 +2993,27 @@ impl SplitContract {
             );
         }
 
-        // Group constraint: all members must be fully funded before any can release.
+        // Group constraint: check according to group mode before allowing release.
         if let Some(group_id) = env
             .storage()
             .persistent()
             .get::<(Symbol, u64), u64>(&invoice_group_key(invoice_id))
         {
-            assert!(group_all_funded(&env, group_id), "group members not fully funded");
+            // Try to load as InvoiceGroup (new format); fall back to AllOrNothing for legacy groups.
+            let mode = env
+                .storage()
+                .persistent()
+                .get::<_, types::InvoiceGroup>(&group_key(group_id))
+                .map(|g| g.mode)
+                .unwrap_or(types::GroupMode::AllOrNothing);
+            match mode {
+                types::GroupMode::AllOrNothing => {
+                    assert!(group_all_funded(&env, group_id), "group members not fully funded");
+                }
+                types::GroupMode::Majority => {
+                    assert!(group_majority_funded(&env, group_id), "group majority not funded");
+                }
+            }
         }
 
         // Co-signer approval check.
@@ -3192,7 +3360,7 @@ impl SplitContract {
         payer.require_auth();
         // Validate memo corresponds to an existing invoice.
         let _ = load_invoice(&env, memo);
-        Self::_pay(&env, &payer, memo, amount, nonce, _auto_convert);
+        Self::_pay(&env, &payer, memo, amount, nonce, _auto_convert, false);
         events::payment_matched(&env, memo, memo, &payer);
     }
 
@@ -3256,7 +3424,18 @@ impl SplitContract {
             .get(&platform_fee_bps_key())
             .unwrap_or(0u32);
 
-        let fee = (proportional as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        let is_waived = waivers.iter().any(|a| a == recipient);
+
+        let fee = if is_waived {
+            0
+        } else {
+            (proportional as u128 * platform_fee_bps as u128 / 10_000u128) as i128
+        };
         let tax = (proportional as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
         let payout = proportional - fee - tax;
 
@@ -3305,6 +3484,13 @@ impl SplitContract {
         let n = invoice.recipients.len();
         let mut total_fee: i128 = 0;
         let mut total_tax: i128 = 0;
+        
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        
         for i in 0..n {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
@@ -3315,7 +3501,12 @@ impl SplitContract {
                 / (10000u128 * total as u128);
             let payout_raw = payout_raw as i128;
             if payout_raw > 0 {
-                let fee = (payout_raw as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+                let is_waived = waivers.iter().any(|a| a == recipient);
+                let fee = if is_waived {
+                    0
+                } else {
+                    (payout_raw as u128 * platform_fee_bps as u128 / 10_000u128) as i128
+                };
                 let tax = (payout_raw as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
                 let payout = payout_raw - fee - tax;
                 total_fee += fee;
@@ -3438,6 +3629,13 @@ impl SplitContract {
         let n = invoice.recipients.len();
         let mut total_fee: i128 = 0;
         let mut total_tax: i128 = 0;
+        
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        
         for i in 0..n {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
@@ -3447,7 +3645,12 @@ impl SplitContract {
                 / (10_000u128 * total as u128);
             let payout_raw = payout_raw as i128;
             if payout_raw > 0 {
-                let fee = (payout_raw as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+                let is_waived = waivers.iter().any(|a| a == recipient);
+                let fee = if is_waived {
+                    0
+                } else {
+                    (payout_raw as u128 * platform_fee_bps as u128 / 10_000u128) as i128
+                };
                 let tax = (payout_raw as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
                 let payout = payout_raw - fee - tax;
                 total_fee += fee;
@@ -3633,8 +3836,15 @@ impl SplitContract {
         let mut total_fee: i128 = 0;
         let mut total_tax: i128 = 0;
         let mut payouts: Vec<i128> = Vec::new(env);
+        
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        
         for i in 0..n {
-            let _recipient = invoice.recipients.get(i).unwrap();
+            let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
 
             // Issue: if split_rules are defined, compute payout from rule instead of amounts[].
@@ -3664,7 +3874,12 @@ impl SplitContract {
             total_tax += tax;
             let post_tax = proportional - tax;
 
-            let fee = (post_tax as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+            let is_waived = waivers.iter().any(|a| a == recipient);
+            let fee = if is_waived {
+                0
+            } else {
+                (post_tax as u128 * platform_fee_bps as u128 / 10_000u128) as i128
+            };
             total_fee += fee;
 
             payouts.push_back(proportional);
@@ -3701,7 +3916,13 @@ impl SplitContract {
 
                 let tax = (proportional as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
                 let post_tax = proportional - tax;
-                let fee = (post_tax as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+                
+                let is_waived = waivers.iter().any(|a| a == recipient);
+                let fee = if is_waived {
+                    0
+                } else {
+                    (post_tax as u128 * platform_fee_bps as u128 / 10_000u128) as i128
+                };
                 let payout = post_tax - fee;
 
                 // Issue #41: if a swap token is configured for this recipient, invoke DEX swap.
@@ -4181,27 +4402,42 @@ impl SplitContract {
 
         // Aggregate payments from all shards (issue #177).
         let mut totals: Map<Address, i128> = Map::new(&env);
+        // Issue #204: separate map for donate-on-failure contributions.
+        let mut donate_totals: Map<Address, i128> = Map::new(&env);
         for shard_id in 0..SHARD_COUNT {
             if let Some(shard_payments) = env.storage().persistent().get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id)) {
                 for payment in shard_payments.iter() {
-                    let prev = totals.get(payment.payer.clone()).unwrap_or(0);
-                    totals.set(payment.payer.clone(), prev + payment.amount);
+                    if payment.donate_on_failure {
+                        let prev = donate_totals.get(payment.payer.clone()).unwrap_or(0);
+                        donate_totals.set(payment.payer.clone(), prev + payment.amount);
+                    } else {
+                        let prev = totals.get(payment.payer.clone()).unwrap_or(0);
+                        totals.set(payment.payer.clone(), prev + payment.amount);
+                    }
                 }
             }
         }
 
         let mut total_refunded_amount: i128 = 0;
         for (payer, amount) in totals.iter() {
-            token_client.transfer(&env.current_contract_address(), &payer, &amount);
-            total_refunded_amount += amount;
-            events::payer_refunded(&env, invoice_id, &payer, amount);
+            if amount > 0 {
+                token_client.transfer(&env.current_contract_address(), &payer, &amount);
+                total_refunded_amount += amount;
+                events::payer_refunded(&env, invoice_id, &payer, amount);
+            }
         }
 
-        if invoice.bonus_pool > 0 {
+        // Issue #204: send all donate-on-failure contributions to the creator.
+        let mut total_donated: i128 = 0;
+        for (_payer, amount) in donate_totals.iter() {
+            total_donated += amount;
+        }
+        let creator_receives = invoice.bonus_pool + total_donated;
+        if creator_receives > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
                 &invoice.creator,
-                &invoice.bonus_pool,
+                &creator_receives,
             );
         }
 
@@ -4843,8 +5079,12 @@ impl SplitContract {
         )
     }
 
-    /// Link invoices into a group: all must be fully funded before any can be released.
-    pub fn create_invoice_group(env: Env, invoice_ids: Vec<u64>) -> u64 {
+    /// Link invoices into a group.
+    ///
+    /// `majority` — when `false` (default), all members must be fully funded before
+    /// any can release (AllOrNothing). When `true`, a strict majority (>50%) being
+    /// fully funded is sufficient to unblock release (Issue #212).
+    pub fn create_invoice_group(env: Env, invoice_ids: Vec<u64>, majority: bool) -> u64 {
         assert!(invoice_ids.len() >= 2, "group needs at least 2 invoices");
 
         let grp_cnt_key = symbol_short!("grp_cnt");
@@ -4861,9 +5101,11 @@ impl SplitContract {
                 .persistent()
                 .set(&invoice_group_key(id), &group_id);
         }
+        let mode = if majority { types::GroupMode::Majority } else { types::GroupMode::AllOrNothing };
+        let group = types::InvoiceGroup { invoice_ids, mode };
         env.storage()
             .persistent()
-            .set(&group_key(group_id), &invoice_ids);
+            .set(&group_key(group_id), &group);
 
         group_id
     }
@@ -5507,7 +5749,7 @@ impl SplitContract {
             .persistent()
             .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
             .unwrap_or_else(|| Vec::new(&env));
-        shard_payments.push_back(Payment { payer: beneficiary.clone(), amount, tip: 0 });
+        shard_payments.push_back(Payment { payer: beneficiary.clone(), amount, tip: 0, donate_on_failure: false });
         env.storage().persistent().set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
         
         invoice.funded += amount;
