@@ -84,6 +84,7 @@ pub struct Payment {
     pub payer: Address,
     pub amount: i128,
     pub tip: i128,
+    pub attestation_hash: Option<BytesN<32>>,
 }
 
 #[contracttype]
@@ -229,6 +230,8 @@ pub struct InvoiceOptions {
     pub priorities: Vec<u32>,
     /// Issue #199: grace period in seconds after deadline before refund is allowed.
     pub refund_grace_secs: Option<u64>,
+    /// Scheduled release timestamp (issue #207).
+    pub scheduled_release_at: Option<u64>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -332,10 +335,7 @@ pub struct InvoiceExt {
     pub payment_cooldown_secs: Option<u64>,
     pub max_payments_per_window: Option<u32>,
     pub payment_window_secs: Option<u64>,
-    /// Issue #211: escalating penalty tiers — each (seconds_after_deadline, bps).
-    pub penalty_tiers: Vec<(u64, u32)>,
-    /// Issue #208: restrict payments to specific calling contracts; None = open.
-    pub allowed_callers: Option<Vec<Address>>,
+    pub scheduled_release_at: Option<u64>,
 }
 
 #[contracttype]
@@ -435,6 +435,8 @@ pub struct Invoice {
     pub payment_cooldown_secs: Option<u64>,
     pub max_payments_per_window: Option<u32>,
     pub payment_window_secs: Option<u64>,
+    /// Scheduled release timestamp (issue #207).
+    pub scheduled_release_at: Option<u64>,
     /// Issue #199: grace period in seconds after deadline before refund is allowed.
     pub refund_grace_secs: Option<u64>,
     /// Issue #211: escalating penalty tiers — each (seconds_after_deadline, bps).
@@ -520,8 +522,7 @@ impl Invoice {
                 payment_cooldown_secs: self.payment_cooldown_secs,
                 max_payments_per_window: self.max_payments_per_window,
                 payment_window_secs: self.payment_window_secs,
-                penalty_tiers: self.penalty_tiers,
-                allowed_callers: self.allowed_callers,
+                scheduled_release_at: self.scheduled_release_at,
             },
             InvoiceExt2 {
                 notification_contract: self.notification_contract,
@@ -600,8 +601,7 @@ impl Invoice {
             payment_cooldown_secs: ext.payment_cooldown_secs,
             max_payments_per_window: ext.max_payments_per_window,
             payment_window_secs: ext.payment_window_secs,
-            penalty_tiers: ext.penalty_tiers,
-            allowed_callers: ext.allowed_callers,
+            scheduled_release_at: ext.scheduled_release_at,
             notification_contract: ext2.notification_contract,
             overflow_behavior: ext2.overflow_behavior,
             cross_chain_ref: ext2.cross_chain_ref,
@@ -642,6 +642,20 @@ pub struct TreasuryRecord {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum GroupMode {
+    AllOrNothing,
+    Majority,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InvoiceGroup {
+    pub invoice_ids: Vec<u64>,
+    pub mode: GroupMode,
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct InvoiceStats {
     pub funded: i128,
@@ -652,6 +666,15 @@ pub struct InvoiceStats {
 }
 
 /// Compact storage representation of Invoice — serializes InvoiceCore fields using minimal byte encoding.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InvoiceSnapshot {
+    pub core: InvoiceCore,
+    pub ext: InvoiceExt,
+    pub ext2: InvoiceExt2,
+    pub audit_log: Vec<AuditEntry>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct CompactInvoice {
@@ -789,6 +812,7 @@ impl Invoice {
             payment_cooldown_secs: None,
             max_payments_per_window: None,
             payment_window_secs: None,
+            scheduled_release_at: None,
             refund_grace_secs: None,
             penalty_tiers: Vec::new(env),
             allowed_callers: None,
