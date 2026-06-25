@@ -3,6 +3,8 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
 
+const SHARD_COUNT: u32 = 8;
+
 mod events;
 mod types;
 
@@ -15,10 +17,10 @@ use soroban_sdk::{
 };
 use soroban_sdk::xdr::ToXdr;
 use types::{
-    AuditEntry, Bid, CloneOverrides, CompactInvoice, CompletionProof, CreateInvoiceParams, Invoice, InvoiceCore,
-    InvoiceExt, InvoiceExt2, InvoiceOptions, InvoicePayment, InvoiceStatus, InvoiceTemplate,
-    LegacyInvoice, OverflowBehavior, Payment, PaymentCertificate, PaymentProof, ResolveAction,
-    ResolveRule, SplitRule, SubscriptionParams, Tranche, TreasuryRecord,
+    AdminRole, AuditEntry, Bid, CloneOverrides, CompactInvoice, CompletionProof, CreateInvoiceParams,
+    Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceOptions, InvoicePayment, InvoiceStatus,
+    InvoiceTemplate, LegacyInvoice, OverflowBehavior, Payment, PaymentCertificate, PaymentProof,
+    ResolveAction, ResolveRule, SplitRule, SubscriptionParams, Tranche, TreasuryRecord,
 };
 
 // ---------------------------------------------------------------------------
@@ -102,6 +104,21 @@ fn group_treasury_key(group_id: u64) -> (Symbol, u64) {
 
 fn template_key(creator: &Address, name: &Symbol) -> (Symbol, Address, Symbol) {
     (symbol_short!("tmpl"), creator.clone(), name.clone())
+}
+
+/// Issue #210: versioned template key.
+fn template_version_key(creator: &Address, name: &Symbol, version: u32) -> (Symbol, Address, Symbol, u32) {
+    (symbol_short!("tmpl_v"), creator.clone(), name.clone(), version)
+}
+
+/// Issue #210: template version counter key.
+fn template_version_count_key(creator: &Address, name: &Symbol) -> (Symbol, Address, Symbol) {
+    (symbol_short!("tmpl_ct"), creator.clone(), name.clone())
+}
+
+/// Issue #209: pending payout key per (invoice_id, recipient).
+fn pending_payout_key(invoice_id: u64, recipient: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("pend_pay"), invoice_id, recipient.clone())
 }
 
 /// Per-address reputation counter key (issue #24).
@@ -360,6 +377,8 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             payment_cooldown_secs: None,
             max_payments_per_window: None,
             payment_window_secs: None,
+            penalty_tiers: Vec::new(env),
+            allowed_callers: None,
         });
     let ext2: InvoiceExt2 = env.storage().persistent()
         .get(&invoice_ext2_key(id))
@@ -375,6 +394,8 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             auction_end: 0,
             bids: Vec::new(env),
             min_payment: 0,
+            min_funding_amount: 0,
+            priorities: Vec::new(env),
         });
     
     // Load compact representation if available
@@ -515,32 +536,10 @@ fn load_treasury_record(env: &Env, group_id: u64) -> TreasuryRecord {
         .expect("treasury record not found")
 }
 
-#[allow(dead_code)]
 fn save_invoice_ext(env: &Env, id: u64, ext: &InvoiceExt) {
     env.storage()
         .persistent()
-        .get::<Symbol, Address>(&dashboard_contract_key())
-    {
-        let _: Val = env.invoke_contract(
-            &dashboard,
-            &Symbol::new(env, "record_created"),
-            (creator.clone(), total).into_val(env),
-        );
-    }
-}
-
-#[allow(dead_code)]
-fn load_invoice_ext(env: &Env, id: u64) -> InvoiceExt {
-    env.storage()
-        .persistent()
-        .get::<Symbol, Address>(&dashboard_contract_key())
-    {
-        let _: Val = env.invoke_contract(
-            &dashboard,
-            &Symbol::new(env, "record_released"),
-            (creator.clone(), total).into_val(env),
-        );
-    }
+        .set(&invoice_ext_key(id), ext);
 }
 
 fn maybe_record_refunded(env: &Env, creator: &Address) {
@@ -1932,6 +1931,8 @@ impl SplitContract {
             condition_met: source.condition_met,
             penalty_bps: source.penalty_bps,
             penalty_deadline: source.penalty_deadline,
+            penalty_tiers: source.penalty_tiers.clone(),
+            allowed_callers: source.allowed_callers.clone(),
             min_funding_bps: source.min_funding_bps,
             release_stages: source.release_stages.clone(),
             released_stages: source.released_stages,
@@ -2143,13 +2144,16 @@ impl SplitContract {
         env.storage().persistent().remove(&channel_key(invoice_id, &payer));
     }
 
-    pub fn pay(env: Env, payer: Address, invoice_id: u64, amount: i128, nonce: u64, _auto_convert: bool) {
+    /// Pay toward an invoice.
+    /// `via` identifies the calling contract or originator for allowlist enforcement (issue #208).
+    /// Pass `None` for direct wallet-to-contract payments.
+    pub fn pay(env: Env, payer: Address, invoice_id: u64, amount: i128, nonce: u64, _auto_convert: bool, via: Option<Address>) {
         require_fn_not_paused(&env, &symbol_short!("pay"));
         payer.require_auth();
-        Self::_pay(&env, &payer, invoice_id, amount, nonce, _auto_convert);
+        Self::_pay(&env, &payer, invoice_id, amount, nonce, _auto_convert, via);
     }
 
-    fn _pay(env: &Env, payer: &Address, invoice_id: u64, amount: i128, nonce: u64, _auto_convert: bool) {
+    fn _pay(env: &Env, payer: &Address, invoice_id: u64, amount: i128, nonce: u64, _auto_convert: bool, via: Option<Address>) {
         let mut invoice = load_invoice(env, invoice_id);
 
         assert!(
@@ -2180,6 +2184,14 @@ impl SplitContract {
         // Check allowed_payers allowlist.
         if let Some(ref whitelist) = invoice.allowed_payers {
             assert!(whitelist.contains(payer), "payer not allowed");
+        }
+
+        // Issue #208: source contract allowlist check.
+        if let Some(ref callers) = invoice.allowed_callers {
+            match via {
+                Some(ref addr) => assert!(callers.contains(addr), "caller not allowed"),
+                None => panic!("direct payments not allowed when caller allowlist is set"),
+            }
         }
 
         // Issue #142: when a price oracle is configured, query current price and
@@ -2309,24 +2321,38 @@ impl SplitContract {
 
         invoice.insurance_fund += premium;
 
-        // Penalty for late payment (issue #42).
-        if invoice.penalty_bps > 0 && env.ledger().timestamp() > invoice.penalty_deadline {
-            let penalty_amount = (amount as u128 * invoice.penalty_bps as u128 / 10_000u128) as i128;
-            if penalty_amount > 0 {
-                let total_amounts: i128 = invoice.amounts.iter().sum();
-                let mut distributed: i128 = 0;
-                let n = invoice.recipients.len();
-                for i in 0..n {
-                    let recipient = invoice.recipients.get(i).unwrap();
-                    let amt = invoice.amounts.get(i).unwrap();
-                    let share = if i == n - 1 {
-                        penalty_amount - distributed
-                    } else {
-                        (penalty_amount as u128 * amt as u128 / total_amounts as u128) as i128
-                    };
-                    distributed += share;
-                    if share > 0 {
-                        token_client.transfer(payer, &recipient, &share);
+        // Penalty for late payment (issues #42, #211).
+        if env.ledger().timestamp() > invoice.penalty_deadline {
+            let penalty_bps: u32 = if !invoice.penalty_tiers.is_empty() {
+                let elapsed = env.ledger().timestamp() - invoice.penalty_deadline;
+                let mut matched_bps = 0u32;
+                for (threshold, bps) in invoice.penalty_tiers.iter() {
+                    if elapsed >= threshold {
+                        matched_bps = bps;
+                    }
+                }
+                matched_bps
+            } else {
+                invoice.penalty_bps
+            };
+            if penalty_bps > 0 {
+                let penalty_amount = (amount as u128 * penalty_bps as u128 / 10_000u128) as i128;
+                if penalty_amount > 0 {
+                    let total_amounts: i128 = invoice.amounts.iter().sum();
+                    let mut distributed: i128 = 0;
+                    let n = invoice.recipients.len();
+                    for i in 0..n {
+                        let recipient = invoice.recipients.get(i).unwrap();
+                        let amt = invoice.amounts.get(i).unwrap();
+                        let share = if i == n - 1 {
+                            penalty_amount - distributed
+                        } else {
+                            (penalty_amount as u128 * amt as u128 / total_amounts as u128) as i128
+                        };
+                        distributed += share;
+                        if share > 0 {
+                            token_client.transfer(payer, &recipient, &share);
+                        }
                     }
                 }
             }
@@ -3070,12 +3096,12 @@ impl SplitContract {
 
     /// Pay toward an invoice using a memo that encodes the invoice id.
     /// Requires payer auth and emits a payment_matched event on success.
-    pub fn pay_with_memo(env: Env, payer: Address, memo: u64, amount: i128, nonce: u64, _auto_convert: bool) {
+    pub fn pay_with_memo(env: Env, payer: Address, memo: u64, amount: i128, nonce: u64, _auto_convert: bool, via: Option<Address>) {
         require_not_paused(&env);
         payer.require_auth();
         // Validate memo corresponds to an existing invoice.
         let _ = load_invoice(&env, memo);
-        Self::_pay(&env, &payer, memo, amount, nonce, _auto_convert);
+        Self::_pay(&env, &payer, memo, amount, nonce, _auto_convert, via);
         events::payment_matched(&env, memo, memo, &payer);
     }
 
@@ -3156,6 +3182,35 @@ impl SplitContract {
         }
 
         append_audit_entry(&env, invoice_id, symbol_short!("claim"), &recipient);
+    }
+
+    /// Claim a pending payout that was not transferred during release (issue #209).
+    /// Recipient can claim their payout after the invoice is Released.
+    pub fn claim_pending_payout(env: Env, invoice_id: u64, recipient: Address) {
+        recipient.require_auth();
+
+        let invoice = load_invoice(&env, invoice_id);
+        assert!(
+            invoice.status == InvoiceStatus::Released,
+            "invoice not released"
+        );
+
+        let pending: i128 = env
+            .storage()
+            .persistent()
+            .get(&pending_payout_key(invoice_id, &recipient))
+            .expect("no pending payout");
+
+        assert!(pending > 0, "no pending payout");
+
+        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        token_client.transfer(&env.current_contract_address(), &recipient, &pending);
+
+        env.storage()
+            .persistent()
+            .remove(&pending_payout_key(invoice_id, &recipient));
+
+        events::pending_payout_claimed(&env, invoice_id, &recipient, pending);
     }
 
     /// Distribute tranches unlocked by the current ledger time (issue #23).
@@ -4633,6 +4688,8 @@ impl SplitContract {
     // -----------------------------------------------------------------------
 
     /// Save a reusable invoice template.
+    /// Save an invoice template. Returns the new version number.
+    /// Each call increments the version counter for (creator, name).
     pub fn save_template(
         env: Env,
         creator: Address,
@@ -4640,7 +4697,7 @@ impl SplitContract {
         recipients: Vec<Address>,
         amounts: Vec<i128>,
         token: Address,
-    ) {
+    ) -> u32 {
         creator.require_auth();
         assert!(
             recipients.len() == amounts.len(),
@@ -4650,6 +4707,14 @@ impl SplitContract {
         for amt in amounts.iter() {
             assert!(amt > 0, "amounts must be positive");
         }
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&template_version_count_key(&creator, &name))
+            .unwrap_or(0u32);
+        let version = count + 1;
+
         let template = InvoiceTemplate {
             recipients,
             amounts,
@@ -4662,22 +4727,54 @@ impl SplitContract {
         };
         env.storage()
             .persistent()
+            .set(&template_version_key(&creator, &name, version), &template);
+        env.storage()
+            .persistent()
+            .set(&template_version_count_key(&creator, &name), &version);
+
+        // Also store under the legacy unversioned key for backward compat.
+        env.storage()
+            .persistent()
             .set(&template_key(&creator, &name), &template);
+
+        version
     }
 
     /// Create a new invoice from a previously saved template.
+    /// When `version` is None, the latest version is used.
     pub fn create_from_template(
         env: Env,
         creator: Address,
         name: Symbol,
         deadline: u64,
+        version: Option<u32>,
     ) -> u64 {
         creator.require_auth();
-        let tmpl: InvoiceTemplate = env
-            .storage()
-            .persistent()
-            .get(&template_key(&creator, &name))
-            .expect("template not found");
+
+        let tmpl: InvoiceTemplate = if let Some(v) = version {
+            env.storage()
+                .persistent()
+                .get(&template_version_key(&creator, &name, v))
+                .expect("template version not found")
+        } else {
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&template_version_count_key(&creator, &name))
+                .unwrap_or(0u32);
+            if count > 0 {
+                env.storage()
+                    .persistent()
+                    .get(&template_version_key(&creator, &name, count))
+                    .expect("latest template not found")
+            } else {
+                // Fall back to legacy unversioned key.
+                env.storage()
+                    .persistent()
+                    .get(&template_key(&creator, &name))
+                    .expect("template not found")
+            }
+        };
         Self::_create_invoice_inner(
             &env,
             creator,
@@ -4724,6 +4821,15 @@ impl SplitContract {
             Vec::new(&env), // priorities
             false, // require_kyc
         )
+    }
+
+    /// Return the number of saved versions for a template (creator, name).
+    /// Returns 0 if no template or versions exist.
+    pub fn get_template_version_count(env: Env, creator: Address, name: Symbol) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&template_version_count_key(&creator, &name))
+            .unwrap_or(0u32)
     }
 
     /// Link invoices into a group: all must be fully funded before any can be released.
@@ -5215,7 +5321,7 @@ impl SplitContract {
                 auto_resolve_rules: Vec::new(&env), creator_cosigner: None, velocity_limit: 0,
                 velocity_window: 0, parent_invoice_id: None, pause_reason: None, auto_resume_at: None,
                 payment_cooldown_secs: None, max_payments_per_window: None, payment_window_secs: None,
-                refund_grace_secs: None,
+                refund_grace_secs: None, penalty_tiers: Vec::new(&env), allowed_callers: None,
             });
         let ext2: InvoiceExt2 = env.storage().persistent()
             .get(&invoice_ext2_key(invoice_id))
@@ -5267,7 +5373,7 @@ impl SplitContract {
                         auto_resolve_rules: Vec::new(&env), creator_cosigner: None, velocity_limit: 0,
                         velocity_window: 0, parent_invoice_id: None, pause_reason: None, auto_resume_at: None,
                         payment_cooldown_secs: None, max_payments_per_window: None, payment_window_secs: None,
-                        admin_frozen: false,
+                        admin_frozen: false, penalty_tiers: Vec::new(&env), allowed_callers: None,
                     });
                 let ext2: InvoiceExt2 = env.storage().persistent()
                     .get(&invoice_ext2_key(id))
