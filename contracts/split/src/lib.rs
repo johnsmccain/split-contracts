@@ -41,6 +41,22 @@ fn paused_key() -> Symbol {
 fn paused_fns_key() -> Symbol {
     symbol_short!("ps_fns")
 }
+
+fn pause_exempt_key(address: &Address) -> (Symbol, Address) {
+    (symbol_short!("p_exempt"), address.clone())
+}
+
+fn global_payer_limit_key() -> Symbol {
+    symbol_short!("g_vel_lim")
+}
+
+fn global_payer_window_key() -> Symbol {
+    symbol_short!("g_vel_win")
+}
+
+fn global_vel_key(payer: &Address) -> (Symbol, Address) {
+    (symbol_short!("g_vel"), payer.clone())
+}
 fn creation_fee_key() -> Symbol {
     symbol_short!("crt_fee")
 }
@@ -684,6 +700,25 @@ impl SplitContract {
         env.storage().persistent().set(&paused_fns_key(), &new_list);
     }
 
+    /// Set an address as exempt from the global pause for invoice creation.
+    /// Requires admin auth.
+    pub fn set_pause_exempt(env: Env, admin: Address, address: Address, exempt: bool) {
+        require_role(&env, &admin, AdminRole::Operator);
+        if exempt {
+            env.storage().persistent().set(&pause_exempt_key(&address), &true);
+        } else {
+            env.storage().persistent().remove(&pause_exempt_key(&address));
+        }
+    }
+
+    /// Set the global payer aggregate limit and window. Requires admin auth.
+    pub fn set_global_payer_limit(env: Env, admin: Address, limit: i128, window_secs: u64) {
+        require_role(&env, &admin, AdminRole::Operator);
+        assert!(limit >= 0, "limit must be non-negative");
+        env.storage().persistent().set(&global_payer_limit_key(), &limit);
+        env.storage().persistent().set(&global_payer_window_key(), &window_secs);
+    }
+
     /// Update the creation fee. Requires admin auth.
     pub fn set_creation_fee(env: Env, admin: Address, creation_fee: i128) {
         require_role(&env, &admin, AdminRole::Operator);
@@ -1177,7 +1212,12 @@ impl SplitContract {
         deadline: u64,
         options: InvoiceOptions,
     ) -> u64 {
-        require_not_paused(&env);
+        // Check if contract is paused, but allow exempt creators
+        let is_paused = is_paused(&env);
+        let is_exempt = env.storage().persistent().get::<_, bool>(&pause_exempt_key(&creator)).unwrap_or(false);
+        if is_paused && !is_exempt {
+            panic!("contract is paused");
+        }
         creator.require_auth();
         Self::_apply_rate_limit(&env, &creator);
 
@@ -1246,6 +1286,7 @@ impl SplitContract {
             options.refund_grace_secs,
             options.priorities,
             options.require_kyc,
+            options.scheduled_release_at,
         )
     }
 
@@ -1295,6 +1336,7 @@ impl SplitContract {
         refund_grace_secs: Option<u64>,
         priorities: Vec<u32>,
         require_kyc: bool,
+        scheduled_release_at: Option<u64>,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -1588,6 +1630,7 @@ impl SplitContract {
             payment_cooldown_secs,
             max_payments_per_window,
             payment_window_secs,
+            scheduled_release_at,
             refund_grace_secs,
             cross_chain_ref,
             require_kyc,
@@ -2022,7 +2065,7 @@ impl SplitContract {
         let mut new_payments: Vec<Payment> = Vec::new(&env);
         for (payer, amount) in payer_amounts.iter() {
             let tip = payer_tips.get(payer.clone()).unwrap_or(0);
-            new_payments.push_back(Payment { payer, amount, tip });
+            new_payments.push_back(Payment { payer, amount, tip, attestation_hash: None });
         }
 
         // Verify total funded is unchanged (optional assertion, as asked by Acceptance Criteria)
@@ -2105,7 +2148,7 @@ impl SplitContract {
                 .persistent()
                 .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
                 .unwrap_or_else(|| Vec::new(&env));
-            shard_payments.push_back(Payment { payer: payer.clone(), amount: net_paid, tip: 0 });
+            shard_payments.push_back(Payment { payer: payer.clone(), amount: net_paid, tip: 0, attestation_hash: None });
             env.storage().persistent().set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
             
             invoice.funded += net_paid;
@@ -2146,10 +2189,22 @@ impl SplitContract {
     pub fn pay(env: Env, payer: Address, invoice_id: u64, amount: i128, nonce: u64, _auto_convert: bool) {
         require_fn_not_paused(&env, &symbol_short!("pay"));
         payer.require_auth();
-        Self::_pay(&env, &payer, invoice_id, amount, nonce, _auto_convert);
+        Self::_pay(&env, &payer, invoice_id, amount, nonce, _auto_convert, None);
     }
 
-    fn _pay(env: &Env, payer: &Address, invoice_id: u64, amount: i128, nonce: u64, _auto_convert: bool) {
+    /// Pay with a signed attestation binding the payment to an off-chain identity
+    pub fn pay_with_attestation(env: Env, payer: Address, invoice_id: u64, amount: i128, nonce: u64, attestation_hash: BytesN<32>, signature: BytesN<64>, signer_pubkey: BytesN<32>, _auto_convert: bool) {
+        require_fn_not_paused(&env, &symbol_short!("pay"));
+        payer.require_auth();
+
+        // Verify ed25519 signature over attestation_hash
+        env.crypto().ed25519_verify(&signer_pubkey, &attestation_hash, &signature);
+
+        // Proceed with payment, storing the attestation hash
+        Self::_pay(&env, &payer, invoice_id, amount, nonce, _auto_convert, Some(attestation_hash));
+    }
+
+    fn _pay(env: &Env, payer: &Address, invoice_id: u64, amount: i128, nonce: u64, _auto_convert: bool, attestation_hash: Option<BytesN<32>>) {
         let mut invoice = load_invoice(env, invoice_id);
 
         assert!(
@@ -2264,6 +2319,26 @@ impl SplitContract {
             env.storage().persistent().set(&vel_key(invoice_id, payer), &window);
         }
 
+        // Global cross-invoice velocity limiting per payer
+        let global_limit: i128 = env.storage().persistent().get(&global_payer_limit_key()).unwrap_or(0i128);
+        if global_limit > 0 {
+            let global_window_secs: u64 = env.storage().persistent().get(&global_payer_window_key()).unwrap_or(0u64);
+            let now = env.ledger().timestamp();
+            let mut global_window: (u64, i128) = env
+                .storage()
+                .persistent()
+                .get(&global_vel_key(payer))
+                .unwrap_or((0u64, 0i128));
+            if now > global_window.0 + global_window_secs {
+                // reset global window
+                global_window.0 = now;
+                global_window.1 = 0;
+            }
+            assert!(global_window.1 + amount <= global_limit, "global payer limit exceeded");
+            global_window.1 += amount;
+            env.storage().persistent().set(&global_vel_key(payer), &global_window);
+        }
+
         let token_client = token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
 
         let credited_amount = match invoice.overflow_behavior {
@@ -2339,7 +2414,7 @@ impl SplitContract {
             .persistent()
             .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
             .unwrap_or_else(|| Vec::new(env));
-        shard_payments.push_back(Payment { payer: payer.clone(), amount: credited_amount, tip: 0 });
+        shard_payments.push_back(Payment { payer: payer.clone(), amount: credited_amount, tip: 0, attestation_hash });
         env.storage().persistent().set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
         
         invoice.funded += credited_amount;
@@ -2498,7 +2573,7 @@ impl SplitContract {
             .persistent()
             .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
             .unwrap_or_else(|| Vec::new(&env));
-        shard_payments.push_back(Payment { payer: payer.clone(), amount: credited_amount, tip: 0 });
+        shard_payments.push_back(Payment { payer: payer.clone(), amount: credited_amount, tip: 0, attestation_hash });
         env.storage().persistent().set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
         
         invoice.funded += credited_amount;
@@ -2570,7 +2645,7 @@ impl SplitContract {
             .persistent()
             .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
             .unwrap_or_else(|| Vec::new(&env));
-        shard_payments.push_back(Payment { payer: payer.clone(), amount: converted, tip: 0 });
+        shard_payments.push_back(Payment { payer: payer.clone(), amount: converted, tip: 0, attestation_hash: None });
         env.storage().persistent().set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
         
         invoice.funded += converted;
@@ -2657,7 +2732,7 @@ impl SplitContract {
                 .persistent()
                 .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(p.invoice_id, shard_id))
                 .unwrap_or_else(|| Vec::new(&env));
-            shard_payments.push_back(Payment { payer: payer.clone(), amount: p.amount, tip: 0 });
+            shard_payments.push_back(Payment { payer: payer.clone(), amount: p.amount, tip: 0, attestation_hash: None });
             env.storage().persistent().set(&pay_shard_key(p.invoice_id, shard_id), &shard_payments);
 
             inv.funded += p.amount;
@@ -2781,6 +2856,48 @@ impl SplitContract {
             );
         }
 
+        Self::_release(&env, invoice_id, &mut invoice, &caller);
+    }
+
+    /// Trigger a scheduled release at the configured timestamp, respecting min_funding_bps
+    pub fn trigger_scheduled_release(env: Env, invoice_id: u64) {
+        require_not_paused(&env);
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        assert!(!invoice.frozen, "invoice is frozen");
+        assert!(!invoice.admin_frozen, "invoice frozen by admin");
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
+
+        let scheduled_at = invoice.scheduled_release_at.expect("no scheduled release time");
+        assert!(env.ledger().timestamp() >= scheduled_at, "scheduled release time not reached");
+
+        // Check min funding requirement if set
+        if invoice.min_funding_bps > 0 {
+            let total: i128 = invoice.amounts.iter().sum();
+            let min_required = (total as u128 * invoice.min_funding_bps as u128 / 10_000u128) as i128;
+            assert!(invoice.funded >= min_required, "minimum funding not reached");
+        }
+
+        // Approval check (issue #25)
+        if invoice.approver.is_some() && !invoice.approved {
+            panic!("awaiting approval");
+        }
+
+        // Prerequisite check (issue #22)
+        if let Some(prereq_id) = invoice.prerequisite_id {
+            let prereq = load_invoice(&env, prereq_id);
+            assert!(prereq.status == InvoiceStatus::Released, "prerequisite not released");
+        }
+
+        // Co-signer approval check
+        if !invoice.co_signers.is_empty() {
+            assert!(
+                invoice.signatures.len() >= invoice.required_signatures,
+                "not enough co-signer approvals"
+            );
+        }
+
+        let caller = env.current_contract_address();
         Self::_release(&env, invoice_id, &mut invoice, &caller);
     }
 
@@ -3758,7 +3875,7 @@ impl SplitContract {
                     .persistent()
                     .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(target_id, shard_id))
                     .unwrap_or_else(|| Vec::new(env));
-                shard_payments.push_back(Payment { payer: env.current_contract_address(), amount: leftover, tip: 0 });
+                shard_payments.push_back(Payment { payer: env.current_contract_address(), amount: leftover, tip: 0, attestation_hash: None });
                 env.storage().persistent().set(&pay_shard_key(target_id, shard_id), &shard_payments);
 
                 target.funded += leftover;
