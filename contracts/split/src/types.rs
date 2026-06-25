@@ -84,6 +84,9 @@ pub struct Payment {
     pub payer: Address,
     pub amount: i128,
     pub tip: i128,
+    /// Issue #204: when true, this payer's contribution is donated to the
+    /// creator on failure instead of being refunded.
+    pub donate_on_failure: bool,
 }
 
 #[contracttype]
