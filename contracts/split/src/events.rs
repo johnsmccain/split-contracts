@@ -176,3 +176,13 @@ pub fn invoice_force_resumed(env: &Env, invoice_id: u64, admin_addr: &Address) {
         admin_addr.clone(),
     );
 }
+
+/// Emitted when a pending payout is claimed by a recipient (issue #209).
+/// Topics: (split, pend_pay, invoice_id)
+/// Data: (recipient, amount)
+pub fn pending_payout_claimed(env: &Env, invoice_id: u64, recipient: &Address, amount: i128) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pend_pay"), invoice_id),
+        (recipient.clone(), amount),
+    );
+}

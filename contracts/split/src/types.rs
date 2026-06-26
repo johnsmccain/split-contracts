@@ -353,6 +353,8 @@ pub struct InvoiceExt2 {
     pub auction_end: u64,
     pub bids: Vec<Bid>,
     pub min_payment: i128,
+    pub min_funding_amount: i128,
+    pub priorities: Vec<u32>,
 }
 
 /// Timelocked admin action queued for future execution.
@@ -437,6 +439,10 @@ pub struct Invoice {
     pub scheduled_release_at: Option<u64>,
     /// Issue #199: grace period in seconds after deadline before refund is allowed.
     pub refund_grace_secs: Option<u64>,
+    /// Issue #211: escalating penalty tiers — each (seconds_after_deadline, bps).
+    pub penalty_tiers: Vec<(u64, u32)>,
+    /// Issue #208: restrict payments to specific calling contracts; None = open.
+    pub allowed_callers: Option<Vec<Address>>,
     pub notification_contract: Option<Address>,
     pub overflow_behavior: OverflowBehavior,
     pub cross_chain_ref: Option<String>,
@@ -447,6 +453,8 @@ pub struct Invoice {
     pub auction_end: u64,
     pub bids: Vec<Bid>,
     pub min_payment: i128,
+    pub min_funding_amount: i128,
+    pub priorities: Vec<u32>,
     pub clone_depth: u32,
 }
 
@@ -527,6 +535,8 @@ impl Invoice {
                 auction_end: self.auction_end,
                 bids: self.bids,
                 min_payment: self.min_payment,
+                min_funding_amount: self.min_funding_amount,
+                priorities: self.priorities,
             },
         )
     }
@@ -602,6 +612,8 @@ impl Invoice {
             auction_end: ext2.auction_end,
             bids: ext2.bids,
             min_payment: ext2.min_payment,
+            min_funding_amount: ext2.min_funding_amount,
+            priorities: ext2.priorities,
         }
     }
 }
@@ -802,6 +814,8 @@ impl Invoice {
             payment_window_secs: None,
             scheduled_release_at: None,
             refund_grace_secs: None,
+            penalty_tiers: Vec::new(env),
+            allowed_callers: None,
             forward_to: None,
             forward_invoice_id: None,
             notification_contract: None,
