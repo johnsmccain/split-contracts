@@ -256,3 +256,69 @@ pub fn invoice_force_resumed(env: &Env, invoice_id: u64, admin_addr: &Address) {
         admin_addr.clone(),
     );
 }
+
+/// Emitted when a pending payout is claimed by a recipient (issue #209).
+/// Topics: (split, pend_pay, invoice_id)
+/// Data: (recipient, amount)
+pub fn pending_payout_claimed(env: &Env, invoice_id: u64, recipient: &Address, amount: i128) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pend_pay"), invoice_id),
+        (recipient.clone(), amount),
+    );
+}
+
+pub fn nft_gate_set(env: &Env, contract: &Option<Address>, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("nft_set")),
+        (contract.clone(), admin.clone()),
+    );
+}
+
+pub fn action_queued(env: &Env, action_id: u64, action: &TimelockAction, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("tl_queue"), action_id),
+        (action.clone(), admin.clone()),
+    );
+}
+
+pub fn action_executed(env: &Env, action_id: u64, action: &TimelockAction) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("tl_exec"), action_id),
+        action.clone(),
+    );
+}
+
+pub fn action_cancelled(env: &Env, action_id: u64, action: &TimelockAction, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("tl_cncl"), action_id),
+        (action.clone(), admin.clone()),
+    );
+}
+
+pub fn invoice_admin_frozen(env: &Env, invoice_id: u64, admin: &Address, reason: &String) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("adm_frz"), invoice_id),
+        (admin.clone(), reason.clone()),
+    );
+}
+
+pub fn invoice_admin_unfrozen(env: &Env, invoice_id: u64, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("adm_unf"), invoice_id),
+        admin.clone(),
+    );
+}
+
+pub fn batch_archived(env: &Env, count: u32, ids: &Vec<u64>) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("bat_arc")),
+        (count, ids.clone()),
+    );
+}
+
+pub fn partial_refund_issued(env: &Env, invoice_id: u64, creator: &Address, bps: u32, amount: i128) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("prt_ref"), invoice_id),
+        (creator.clone(), bps, amount),
+    );
+}
